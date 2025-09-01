@@ -1,9 +1,9 @@
 task: AneurysmSeg
 logging_folder: logs
-ckpt_folder: ckpt
+ckpt_folder: PRETRAINED
 summary_folder: summary
 load_best_model: False  # if false, load last. else load best checkpoint
-ckpt_file: checkpoint-0245700.pt  # ckpt file name to load. set null to load the latest ckpt
+ckpt_file: checkpoint-0245700.pt
 
 # will be sent to model as kwargs
 model:
@@ -39,3 +39,4 @@ train:
 eval:
   phase: inference  # phase tag to identify different inference runs
   probability_threshold: 0.5  # to generate label mask from probability map
+
