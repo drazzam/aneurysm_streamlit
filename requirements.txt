@@ -12,4 +12,4 @@ pandas>=2.2
 pydicom>=2.4
 matplotlib>=3.5
 medpy>=0.4
-sklearn>=1.0
+scikit-learn>=1.0
