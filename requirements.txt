@@ -1,0 +1,12 @@
+streamlit>=1.36
+torch>=2.2,<2.4
+numpy>=1.23
+nibabel>=5.1
+SimpleITK>=2.3
+scikit-image>=0.23
+pyyaml>=6.0
+colorlog>=6.8
+tensorboardX>=2.6
+opencv-python-headless>=4.8
+pandas>=2.2
+pydicom>=2.4
