@@ -10,3 +10,6 @@ tensorboardX>=2.6
 opencv-python-headless>=4.8
 pandas>=2.2
 pydicom>=2.4
+matplotlib>=3.5
+medpy>=0.4
+sklearn>=1.0
