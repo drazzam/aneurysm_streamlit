@@ -35,6 +35,7 @@ import streamlit as st
 import SimpleITK as sitk
 from pathlib import Path
 from skimage.measure import label, regionprops
+import gc
 
 # ----------------------------- App Config -----------------------------
 st.set_page_config(page_title="CTA Aneurysm — GLIA‑Net + Atlas Labels", layout="wide")
@@ -93,7 +94,7 @@ except Exception as e:
 
 # --------------------------- GLIA‑Net Runner --------------------------
 def _load_glia_config(cfg_path: Path):
-    # Use GLIA’s loader if present; otherwise use yaml.safe_load
+    # Use GLIA's loader if present; otherwise use yaml.safe_load
     if cfg_path.exists():
         try:
             cfg = load_config(str(cfg_path))
@@ -139,6 +140,13 @@ def run_glianet_inference(input_path: Path,
     config = _load_glia_config(cfg_path)
     config = _ensure_ckpt_in_config(config)
 
+    # FIXED: Disable multiprocessing for Streamlit Cloud
+    config['data']['num_proc_workers'] = 0
+    
+    # FIXED: Reduce batch size for memory efficiency
+    if 'train' in config:
+        config['train']['batch_size'] = 1
+
     logger = get_logger("GLIA-Infer", logging_folder=None, verbose=False)
     devices = get_devices(device_str, logger)
 
@@ -162,6 +170,12 @@ def run_glianet_inference(input_path: Path,
     )
 
     infer.inference()
+
+    # ADDED: Memory cleanup
+    if hasattr(infer, 'model'):
+        del infer.model
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    gc.collect()
 
     pred_path = _resolve_output_path(output_dir)
     if pred_path is None or not pred_path.exists():
@@ -368,7 +382,11 @@ device_choice = st.sidebar.selectbox(
 
 def resolve_device_string(choice: str) -> str:
     if choice.startswith("GPU:"):
-        return choice.split(":")[1]  # "0", "1", ...
+        gpu_id = choice.split(":")[1]
+        if torch.cuda.is_available() and int(gpu_id) < torch.cuda.device_count():
+            return gpu_id
+        else:
+            return "cpu"  # Fallback to CPU if GPU not available
     if choice.startswith("Auto"):
         return "0" if has_cuda else "cpu"
     return "cpu"
@@ -399,7 +417,7 @@ if reset_case:
             pass
     for k in ["case_dir","input_kind","patient_img","vol_np","spacing_zyx","pred_path","mask_np","lesions","atlas_np"]:
         st.session_state[k] = None if k != "lesions" else []
-    st.experimental_rerun()
+    st.rerun()
 
 # ---------------------------- Load the Study --------------------------
 with st.spinner("Preparing input..."):
@@ -481,7 +499,8 @@ with left:
 
         img_u8 = window_ct(vol[z], wl, ww)
         rgb = draw_overlay(img_u8, mask_slice, lesions_here=lesions_here, show_boxes=show_boxes)
-        st.image(rgb, caption=f"Axial slice {z}", use_column_width=True)
+        # FIXED: Changed use_column_width to use_container_width
+        st.image(rgb, caption=f"Axial slice {z}", use_container_width=True)
 
 with right:
     st.subheader("Pipeline")
@@ -577,8 +596,8 @@ with st.expander("ℹ️ Help & Notes"):
 - **Display**: Use the **Axial slice** slider to scroll. Red = mask contour; green = lesion box with ID (and territory if enabled).
 - **CPU/GPU**: On GPU hosts, choose **GPU:0** (or Auto). On CPU, it still works—just slower.
 - **Troubleshooting**:
-  - If you see *“Missing GLIA‑Net repo folder”*, make sure the GLIA repo is checked out as `glianet/` or `GLIA-Net/` next to this file.
-  - If checkpoint isn’t found, verify the file at `PRETRAINED/checkpoint-0245700.pt`.
+  - If you see *"Missing GLIA‑Net repo folder"*, make sure the GLIA repo is checked out as `glianet/` or `GLIA-Net/` next to this file.
+  - If checkpoint isn't found, verify the file at `PRETRAINED/checkpoint-0245700.pt`.
   - If DICOM upload fails, ensure the .zip contains only the target series (or the first found series is OK).
 """
     )
