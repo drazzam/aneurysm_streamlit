@@ -1,5 +1,5 @@
 streamlit>=1.36
-torch>=2.2,<2.4
+torch>=2.2
 numpy>=1.23
 nibabel>=5.1
 SimpleITK>=2.3
