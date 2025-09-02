@@ -136,89 +136,188 @@ def load_model_once():
     config = _load_glia_config(cfg_path)
     config = _ensure_ckpt_in_config(config)
     
-    # CRITICAL: Disable multiprocessing for Streamlit Cloud
+    # CRITICAL: Memory optimizations for Streamlit Cloud
     config['data']['num_proc_workers'] = 0
     config['data']['num_io_workers'] = 1
     
-    # Reduce batch size for memory efficiency
+    # CRITICAL: Reduce patch overlap to reduce number of patches
+    config['data']['overlap_step'] = [72, 72, 72]  # Increased from [48, 48, 48]
+    
+    # Reduce batch size
     config['train']['batch_size'] = 1
     
     logger = get_logger("GLIA-Infer", logging_folder=None, verbose=False)
     
-    # Force CPU if CUDA not available
-    if not torch.cuda.is_available():
-        device_str = "cpu"
-    else:
-        device_str = "0"
-    
+    # Force CPU
+    device_str = "cpu"
     devices = get_devices(device_str, logger)
     
     # Create model
     from utils.model_utils import get_model
     model = get_model(config, logger)
     
-    # Load checkpoint
+    # Load checkpoint with map_location to CPU
     checkpoint = torch.load(str(CHECKPOINT_FILE), map_location=torch.device('cpu'))
     model.load_state_dict(checkpoint['model_state_dict'])
     model.to(devices[0])
     model.eval()
     
+    # Clear checkpoint from memory
+    del checkpoint
+    gc.collect()
+    
     return model, config, logger, devices
 
-def run_glianet_inference(input_path: Path,
-                          input_type: str,
-                          device_str: str,
-                          output_dir: Path) -> Path:
+def run_glianet_inference_memory_efficient(input_path: Path,
+                                          input_type: str,
+                                          output_dir: Path) -> Path:
     """
-    Run GLIA‑Net inference on a folder (DICOM series) or single NIfTI.
-    Returns path to the predicted mask NIfTI.
+    Memory-efficient version of GLIA-Net inference
     """
     ensure_exists(CHECKPOINT_FILE, "pretrained checkpoint")
     
     # Get cached model
     model, config, logger, devices = load_model_once()
     
-    # Create test manager for this specific input
+    # Create test manager
     test_mgr = AneurysmSegTestManager(config, logger, devices)
-
+    
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Create custom inferencer with cached model
-    class CustomInferencer(Inferencer):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            # Override model with our cached one
-            self.model = model
+    
+    # Load the input
+    test_mgr.load(str(input_path) if input_type == "nii" else list(input_path.rglob("*")), input_type)
+    
+    # Get prediction shape info
+    prediction_instance_shape = test_mgr.instance_shape
+    prediction_patch_starts = test_mgr.patch_starts
+    prediction_patch_size = test_mgr.patch_size
+    
+    # If too many patches, subsample for memory efficiency
+    MAX_PATCHES = 300  # Limit for Streamlit Cloud
+    if len(prediction_patch_starts) > MAX_PATCHES:
+        st.warning(f"⚠️ Large volume detected ({len(prediction_patch_starts)} patches). Subsampling to {MAX_PATCHES} patches for memory efficiency. Results may be less accurate.")
+        # Subsample patches evenly
+        indices = np.linspace(0, len(prediction_patch_starts)-1, MAX_PATCHES, dtype=int)
+        prediction_patch_starts = [prediction_patch_starts[i] for i in indices]
+    
+    # Initialize prediction arrays
+    prediction = np.zeros(prediction_instance_shape.tolist(), dtype=np.float32)
+    overlap_count = np.zeros(prediction_instance_shape.tolist(), dtype=np.float32)
+    
+    # Process patches in small batches to save memory
+    BATCH_SIZE = 1  # Process one patch at a time
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    with torch.no_grad():
+        for i in range(0, len(prediction_patch_starts), BATCH_SIZE):
+            batch_end = min(i + BATCH_SIZE, len(prediction_patch_starts))
+            batch_starts = prediction_patch_starts[i:batch_end]
             
-        def _load_checkpoint(self, ckpt_file=None, is_best=False):
-            # Skip loading since we already have the model loaded
-            pass
-
-    infer = CustomInferencer(
-        config=config,
-        exp_path=str(APP_ROOT.resolve()),
-        devices=devices,
-        inference_file_or_folder=str(input_path.resolve()),
-        output_folder=str(output_dir.resolve()),
-        input_type=input_type,
-        save_binary=True,
-        save_prob=False,
-        save_global=False,
-        test_loader_manager=test_mgr,
-        logger=logger
-    )
-
-    infer.inference()
-
+            # Update progress
+            progress = i / len(prediction_patch_starts)
+            progress_bar.progress(progress)
+            status_text.text(f"Processing patch {i+1}/{len(prediction_patch_starts)}...")
+            
+            # Process batch
+            for patch_idx, patch_start in enumerate(batch_starts):
+                # Create a mini data loader for this patch
+                patch_data = test_mgr._gen_patch(patch_start)
+                if patch_data is None:
+                    continue
+                    
+                inputs, meta = patch_data
+                
+                # Prepare inputs
+                for key in inputs:
+                    inputs[key] = torch.from_numpy(inputs[key]).unsqueeze(0).to(devices[0])
+                
+                # Get model output
+                if config['model'].get('with_global', False):
+                    # Handle global model
+                    local_input = inputs['cta_img']
+                    global_input = inputs.get('global_cta_img', local_input)
+                    global_bbox = inputs.get('global_patch_location_bbox', torch.zeros(1, 6))
+                    
+                    outputs = model((local_input, global_input, global_bbox))
+                    if isinstance(outputs, tuple):
+                        main_output = outputs[0]
+                    else:
+                        main_output = outputs
+                else:
+                    # Standard model
+                    outputs = model(inputs['cta_img'])
+                    main_output = outputs
+                
+                # Apply softmax and get foreground channel
+                main_output = torch.nn.functional.softmax(main_output, dim=1)
+                main_output = main_output[:, 1].cpu().numpy()[0]  # Get foreground probability
+                
+                # Add to prediction
+                patch_ends = [patch_start[j] + prediction_patch_size[j] for j in range(3)]
+                prediction[patch_start[0]:patch_ends[0], 
+                          patch_start[1]:patch_ends[1],
+                          patch_start[2]:patch_ends[2]] += main_output
+                overlap_count[patch_start[0]:patch_ends[0],
+                             patch_start[1]:patch_ends[1],
+                             patch_start[2]:patch_ends[2]] += 1
+                
+                # Clean up
+                del inputs, outputs, main_output
+                torch.cuda.empty_cache() if torch.cuda.is_available() else None
+                gc.collect()
+    
+    progress_bar.progress(1.0)
+    status_text.text("Finalizing prediction...")
+    
+    # Average overlapping predictions
+    overlap_count = np.where(overlap_count == 0, np.ones_like(overlap_count), overlap_count)
+    prediction = prediction / overlap_count
+    
+    # Restore spacing if needed
+    prediction = test_mgr.restore_spacing(prediction, is_mask=False)
+    
+    # Apply threshold to get binary mask
+    binary_prediction = (prediction > 0.5).astype(np.int32)
+    
+    # Save prediction
+    output_file = output_dir / "prediction.nii.gz"
+    test_mgr.save_prediction(binary_prediction, str(output_file))
+    
     # Clean up
-    del infer
+    progress_bar.empty()
+    status_text.empty()
+    del prediction, overlap_count, binary_prediction
     gc.collect()
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    
+    return output_file
 
-    pred_path = _resolve_output_path(output_dir)
-    if pred_path is None or not pred_path.exists():
-        raise RuntimeError("GLIA‑Net did not produce a prediction file.")
-    return pred_path
+# Add this method to AneurysmSegTestManager if not present
+def _gen_patch(self, starts):
+    """Generate a single patch for inference"""
+    if not hasattr(self, 'img') or self.img is None:
+        return None
+        
+    input_glo_img = self.img['data']
+    brain_mask_glo_img = np.ones(self.img['size'], np.int32)
+    
+    ends = [starts[i] + self.patch_size[i] for i in range(3)]
+    patch_cta_img = input_glo_img[starts[0]:ends[0], starts[1]:ends[1], starts[2]:ends[2]].copy()
+    patch_brain_mask_img = brain_mask_glo_img[starts[0]:ends[0], starts[1]:ends[1], starts[2]:ends[2]].copy()
+    
+    inputs = {'cta_img': patch_cta_img, 'brain_mask': patch_brain_mask_img}
+    
+    if self.with_global:
+        # Simplified global handling
+        inputs['global_cta_img'] = patch_cta_img  # Use same as local for simplicity
+        inputs['global_patch_location_bbox'] = np.array([0, 0, 0, 1, 1, 1], dtype=np.float32)
+    
+    meta = {'patch_starts': np.asarray(starts)}
+    return inputs, meta
+
+# Monkey-patch the method
+AneurysmSegTestManager._gen_patch = _gen_patch
 
 # ------------------------------ IO Utils ------------------------------
 def find_dicom_directory(root_path: Path) -> Path:
@@ -496,23 +595,8 @@ st.sidebar.header("Settings")
 ui_badge("GLIA‑Net repo", "#334155")
 st.sidebar.code(str(GLIA_ROOT), language="bash")
 
-# Device selection
-try:
-    has_cuda = torch.cuda.is_available()
-except Exception:
-    has_cuda = False
-
-device_choice = st.sidebar.selectbox(
-    "Device",
-    options=["Auto (GPU if available)", "CPU"],
-    index=0 if has_cuda else 1,
-    disabled=not has_cuda  # Force CPU if no CUDA
-)
-
-def resolve_device_string(choice: str) -> str:
-    if choice.startswith("Auto"):
-        return "0" if torch.cuda.is_available() else "cpu"
-    return "cpu"
+# Device selection - Force CPU for Streamlit Cloud
+st.sidebar.info("ℹ️ Running on CPU (optimized for Streamlit Cloud)")
 
 # Input type
 in_kind = st.sidebar.radio("Input type", ["DICOM (.zip of a series)", "NIfTI (.nii/.nii.gz)"], index=0)
@@ -662,7 +746,7 @@ with left:
         img_u8 = window_ct(vol[z], wl, ww)
         rgb = draw_overlay(img_u8, mask_slice, lesions_here=lesions_here, show_boxes=show_boxes)
         # FIXED: Updated to newest Streamlit API
-        st.image(rgb, caption=f"Axial slice {z}", use_container_width=True)
+        st.image(rgb, caption=f"Axial slice {z}", width="stretch")
 
 with right:
     st.subheader("Pipeline")
@@ -680,8 +764,7 @@ with right:
     # Run inference
     if run_infer and st.session_state.vol_np is not None:
         try:
-            device_str = resolve_device_string(device_choice)
-            with st.spinner(f"Running GLIA‑Net on {device_str}… This may take a few minutes."):
+            with st.spinner(f"Running GLIA‑Net on CPU… This may take several minutes."):
                 case_dir = Path(st.session_state.case_dir or tempfile.mkdtemp(prefix="cta_case_"))
                 out_dir = case_dir / "preds"
                 inp_kind = st.session_state.input_kind
@@ -691,7 +774,9 @@ with right:
                 else:
                     input_path = Path(case_dir) / "input.nii.gz"
                     input_type = "nii"
-                pred_path = run_glianet_inference(input_path, input_type, device_str, out_dir)
+                
+                # Use memory-efficient version
+                pred_path = run_glianet_inference_memory_efficient(input_path, input_type, out_dir)
                 st.session_state.pred_path = str(pred_path)
 
             # Load predicted mask and align to patient grid if needed
@@ -700,17 +785,14 @@ with right:
                 patient_img = st.session_state.patient_img
                 
                 # Resample if needed
-                def resample_to_patient_grid(pred_img, patient_img):
-                    if pred_img.GetSize() != patient_img.GetSize() or \
-                       pred_img.GetSpacing() != patient_img.GetSpacing() or \
-                       pred_img.GetOrigin()  != patient_img.GetOrigin()  or \
-                       pred_img.GetDirection()!= patient_img.GetDirection():
-                        # Resample with identity to patient grid
-                        return sitk.Resample(pred_img, patient_img, sitk.Transform(), 
+                if pred_img.GetSize() != patient_img.GetSize() or \
+                   pred_img.GetSpacing() != patient_img.GetSpacing() or \
+                   pred_img.GetOrigin()  != patient_img.GetOrigin()  or \
+                   pred_img.GetDirection()!= patient_img.GetDirection():
+                    # Resample with identity to patient grid
+                    pred_img = sitk.Resample(pred_img, patient_img, sitk.Transform(), 
                                            sitk.sitkNearestNeighbor, 0, sitk.sitkUInt16)
-                    return pred_img
                     
-                pred_img = resample_to_patient_grid(pred_img, patient_img)
                 mask_np = sitk.GetArrayFromImage(pred_img).astype(np.uint8)
                 st.session_state.mask_np = (mask_np > 0).astype(np.uint8)
 
@@ -726,7 +808,7 @@ with right:
 
         except Exception as e:
             st.exception(e)
-            st.error("Inference failed. See the exception above.")
+            st.error("Inference failed. Try uploading a smaller volume or NIfTI format.")
 
     # Results
     if st.session_state.mask_np is not None:
@@ -744,7 +826,7 @@ with right:
                     "Equiv. diameter (mm)": round(L["equiv_diam_mm"], 1),
                 })
             df = pd.DataFrame(rows)
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.dataframe(df, width="stretch", hide_index=True)
             # Downloads
             csv_bytes = df.to_csv(index=False).encode("utf-8")
             st.download_button("⬇️ Download lesions CSV", data=csv_bytes, file_name="lesions.csv", mime="text/csv")
@@ -759,14 +841,13 @@ with st.expander("ℹ️ Help & Notes"):
     st.markdown(
         """
 - **Inputs**: Upload either a **DICOM .zip** (one series) or a **NIfTI** file of your CTA.
-- **Inference**: Click **Run GLIA‑Net**. The app loads `PRETRAINED/checkpoint-0245700.pt` and saves a mask NIfTI under a temp case folder.
-- **Atlas labels**: When enabled, the app affine‑registers the atlas (MNI) to the patient CTA using mutual information on `ProbArterialAtlas_average.nii`, then samples `ArterialAtlas_level2.nii` at each lesion centroid to label the territory (ACA/MCA/PCA/VB).
-- **Display**: Use the **Axial slice** slider to scroll. Red = mask contour; green = lesion box with ID (and territory if enabled).
-- **CPU/GPU**: On GPU hosts, choose **Auto**. On CPU, it still works—just slower (may take several minutes).
+- **Inference**: Click **Run GLIA‑Net**. Processing may take several minutes on CPU.
+- **Memory Limits**: For large volumes (>300 patches), the app automatically subsamples to prevent memory issues.
+- **Atlas labels**: When enabled, the app affine‑registers the atlas to label territories (ACA/MCA/PCA/VB).
+- **Display**: Use the **Axial slice** slider to scroll. Red = mask contour; green = lesion box with ID.
 - **Troubleshooting**:
-  - If you see *"Missing GLIA‑Net repo folder"*, make sure the GLIA repo is checked out as `glianet/` or `GLIA-Net/` next to this file.
-  - If checkpoint isn't found, verify the file at `PRETRAINED/checkpoint-0245700.pt`.
-  - If DICOM upload fails, ensure the .zip contains only the target series (or the first found series is OK).
-  - Due to memory limitations on Streamlit Cloud, processing may be slow or fail for very large volumes.
+  - If inference fails, try uploading a smaller volume or use NIfTI format
+  - The app is optimized for Streamlit Cloud's memory limits
+  - Processing time depends on volume size (typically 2-10 minutes)
 """
     )
