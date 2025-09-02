@@ -36,6 +36,7 @@ import SimpleITK as sitk
 from pathlib import Path
 from skimage.measure import label, regionprops
 import gc
+import torch
 
 # ----------------------------- App Config -----------------------------
 st.set_page_config(page_title="CTA Aneurysm — GLIA‑Net + Atlas Labels", layout="wide")
@@ -128,6 +129,42 @@ def _resolve_output_path(output_dir: Path) -> Path | None:
         return None
     return max(cands, key=lambda p: p.stat().st_mtime)
 
+@st.cache_resource(show_spinner=False)
+def load_model_once():
+    """Load the model once and cache it"""
+    cfg_path = GLIA_ROOT / "configs" / "inference_GLIA-Net.yaml"
+    config = _load_glia_config(cfg_path)
+    config = _ensure_ckpt_in_config(config)
+    
+    # CRITICAL: Disable multiprocessing for Streamlit Cloud
+    config['data']['num_proc_workers'] = 0
+    config['data']['num_io_workers'] = 1
+    
+    # Reduce batch size for memory efficiency
+    config['train']['batch_size'] = 1
+    
+    logger = get_logger("GLIA-Infer", logging_folder=None, verbose=False)
+    
+    # Force CPU if CUDA not available
+    if not torch.cuda.is_available():
+        device_str = "cpu"
+    else:
+        device_str = "0"
+    
+    devices = get_devices(device_str, logger)
+    
+    # Create model
+    from utils.model_utils import get_model
+    model = get_model(config, logger)
+    
+    # Load checkpoint
+    checkpoint = torch.load(str(CHECKPOINT_FILE), map_location=torch.device('cpu'))
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.to(devices[0])
+    model.eval()
+    
+    return model, config, logger, devices
+
 def run_glianet_inference(input_path: Path,
                           input_type: str,
                           device_str: str,
@@ -137,33 +174,34 @@ def run_glianet_inference(input_path: Path,
     Returns path to the predicted mask NIfTI.
     """
     ensure_exists(CHECKPOINT_FILE, "pretrained checkpoint")
-    cfg_path = GLIA_ROOT / "configs" / "inference_GLIA-Net.yaml"
-    config = _load_glia_config(cfg_path)
-    config = _ensure_ckpt_in_config(config)
-
-    # FIXED: Disable multiprocessing for Streamlit Cloud
-    config['data']['num_proc_workers'] = 0
     
-    # FIXED: Reduce batch size for memory efficiency
-    if 'train' in config:
-        config['train']['batch_size'] = 1
-
-    logger = get_logger("GLIA-Infer", logging_folder=None, verbose=False)
-    devices = get_devices(device_str, logger)
-
-    # Data manager (handles resampling/tiling per config)
+    # Get cached model
+    model, config, logger, devices = load_model_once()
+    
+    # Create test manager for this specific input
     test_mgr = AneurysmSegTestManager(config, logger, devices)
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    infer = Inferencer(
+    # Create custom inferencer with cached model
+    class CustomInferencer(Inferencer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            # Override model with our cached one
+            self.model = model
+            
+        def _load_checkpoint(self, ckpt_file=None, is_best=False):
+            # Skip loading since we already have the model loaded
+            pass
+
+    infer = CustomInferencer(
         config=config,
-        exp_path=str(APP_ROOT.resolve()),            # so ckpt_folder is relative to the app root
+        exp_path=str(APP_ROOT.resolve()),
         devices=devices,
         inference_file_or_folder=str(input_path.resolve()),
         output_folder=str(output_dir.resolve()),
-        input_type=input_type,                       # "dcm" or "nii"
-        save_binary=True,                            # write binary mask
+        input_type=input_type,
+        save_binary=True,
         save_prob=False,
         save_global=False,
         test_loader_manager=test_mgr,
@@ -172,11 +210,10 @@ def run_glianet_inference(input_path: Path,
 
     infer.inference()
 
-    # ADDED: Memory cleanup
-    if hasattr(infer, 'model'):
-        del infer.model
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    # Clean up
+    del infer
     gc.collect()
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
     pred_path = _resolve_output_path(output_dir)
     if pred_path is None or not pred_path.exists():
@@ -240,6 +277,11 @@ def read_patient_image(input_kind: str, path: Path) -> sitk.Image:
         dicom_dir = find_dicom_directory(path)
         
         reader = sitk.ImageSeriesReader()
+        # Set GDCM to be less strict
+        reader.SetGlobalWarningDisplay(False)
+        reader.SetMetaDataDictionaryArrayUpdate(True)
+        reader.SetLoadPrivateTags(False)
+        
         series_ids = reader.GetGDCMSeriesIDs(str(dicom_dir))
         
         if not series_ids:
@@ -462,19 +504,14 @@ except Exception:
 
 device_choice = st.sidebar.selectbox(
     "Device",
-    options=["Auto (GPU if available)", "CPU"] + ([f"GPU:{i}" for i in range(4)] if has_cuda else []),
-    index=0
+    options=["Auto (GPU if available)", "CPU"],
+    index=0 if has_cuda else 1,
+    disabled=not has_cuda  # Force CPU if no CUDA
 )
 
 def resolve_device_string(choice: str) -> str:
-    if choice.startswith("GPU:"):
-        gpu_id = choice.split(":")[1]
-        if torch.cuda.is_available() and int(gpu_id) < torch.cuda.device_count():
-            return gpu_id
-        else:
-            return "cpu"  # Fallback to CPU if GPU not available
     if choice.startswith("Auto"):
-        return "0" if has_cuda else "cpu"
+        return "0" if torch.cuda.is_available() else "cpu"
     return "cpu"
 
 # Input type
@@ -500,7 +537,7 @@ else:
     - 3D volume expected
     - Typical file sizes: 10MB - 100MB
     """)
-    nii_file = st.sidebar.file_uploader("Upload NIfTI (.nii or .nii.gz)", type=["nii", "nii.gz"])
+    nii_file = st.sidebar.file_uploader("Upload NIfTI (.nii or .nii.gz)", type=["nii", "gz"])
 
 # Actions
 colA, colB = st.sidebar.columns(2)
@@ -625,7 +662,7 @@ with left:
         img_u8 = window_ct(vol[z], wl, ww)
         rgb = draw_overlay(img_u8, mask_slice, lesions_here=lesions_here, show_boxes=show_boxes)
         # FIXED: Updated to newest Streamlit API
-        st.image(rgb, caption=f"Axial slice {z}", width="stretch")
+        st.image(rgb, caption=f"Axial slice {z}", use_container_width=True)
 
 with right:
     st.subheader("Pipeline")
@@ -644,7 +681,7 @@ with right:
     if run_infer and st.session_state.vol_np is not None:
         try:
             device_str = resolve_device_string(device_choice)
-            with st.spinner(f"Running GLIA‑Net on {device_str}…"):
+            with st.spinner(f"Running GLIA‑Net on {device_str}… This may take a few minutes."):
                 case_dir = Path(st.session_state.case_dir or tempfile.mkdtemp(prefix="cta_case_"))
                 out_dir = case_dir / "preds"
                 inp_kind = st.session_state.input_kind
@@ -661,12 +698,19 @@ with right:
             with st.spinner("Loading prediction…"):
                 pred_img = sitk.ReadImage(st.session_state.pred_path)
                 patient_img = st.session_state.patient_img
-                if pred_img.GetSize() != patient_img.GetSize() or \
-                   pred_img.GetSpacing() != patient_img.GetSpacing() or \
-                   pred_img.GetOrigin()  != patient_img.GetOrigin()  or \
-                   pred_img.GetDirection()!= patient_img.GetDirection():
-                    # Resample with identity to patient grid
-                    pred_img = resample_to_patient(pred_img, patient_img, sitk.Transform(), is_label=True)
+                
+                # Resample if needed
+                def resample_to_patient_grid(pred_img, patient_img):
+                    if pred_img.GetSize() != patient_img.GetSize() or \
+                       pred_img.GetSpacing() != patient_img.GetSpacing() or \
+                       pred_img.GetOrigin()  != patient_img.GetOrigin()  or \
+                       pred_img.GetDirection()!= patient_img.GetDirection():
+                        # Resample with identity to patient grid
+                        return sitk.Resample(pred_img, patient_img, sitk.Transform(), 
+                                           sitk.sitkNearestNeighbor, 0, sitk.sitkUInt16)
+                    return pred_img
+                    
+                pred_img = resample_to_patient_grid(pred_img, patient_img)
                 mask_np = sitk.GetArrayFromImage(pred_img).astype(np.uint8)
                 st.session_state.mask_np = (mask_np > 0).astype(np.uint8)
 
@@ -683,7 +727,6 @@ with right:
         except Exception as e:
             st.exception(e)
             st.error("Inference failed. See the exception above.")
-            st.stop()
 
     # Results
     if st.session_state.mask_np is not None:
@@ -701,7 +744,7 @@ with right:
                     "Equiv. diameter (mm)": round(L["equiv_diam_mm"], 1),
                 })
             df = pd.DataFrame(rows)
-            st.dataframe(df, width="stretch", hide_index=True)
+            st.dataframe(df, use_container_width=True, hide_index=True)
             # Downloads
             csv_bytes = df.to_csv(index=False).encode("utf-8")
             st.download_button("⬇️ Download lesions CSV", data=csv_bytes, file_name="lesions.csv", mime="text/csv")
@@ -719,10 +762,11 @@ with st.expander("ℹ️ Help & Notes"):
 - **Inference**: Click **Run GLIA‑Net**. The app loads `PRETRAINED/checkpoint-0245700.pt` and saves a mask NIfTI under a temp case folder.
 - **Atlas labels**: When enabled, the app affine‑registers the atlas (MNI) to the patient CTA using mutual information on `ProbArterialAtlas_average.nii`, then samples `ArterialAtlas_level2.nii` at each lesion centroid to label the territory (ACA/MCA/PCA/VB).
 - **Display**: Use the **Axial slice** slider to scroll. Red = mask contour; green = lesion box with ID (and territory if enabled).
-- **CPU/GPU**: On GPU hosts, choose **GPU:0** (or Auto). On CPU, it still works—just slower.
+- **CPU/GPU**: On GPU hosts, choose **Auto**. On CPU, it still works—just slower (may take several minutes).
 - **Troubleshooting**:
   - If you see *"Missing GLIA‑Net repo folder"*, make sure the GLIA repo is checked out as `glianet/` or `GLIA-Net/` next to this file.
   - If checkpoint isn't found, verify the file at `PRETRAINED/checkpoint-0245700.pt`.
   - If DICOM upload fails, ensure the .zip contains only the target series (or the first found series is OK).
+  - Due to memory limitations on Streamlit Cloud, processing may be slow or fail for very large volumes.
 """
     )
