@@ -138,7 +138,7 @@ def load_model_once():
     
     # CRITICAL: Memory optimizations for Streamlit Cloud
     config['data']['num_proc_workers'] = 0
-    config['data']['num_io_workers'] = 1
+    config['data']['num_io_workers'] = 0  # Set to 0 to avoid multiprocessing issues
     
     # CRITICAL: Reduce patch overlap to reduce number of patches
     config['data']['overlap_step'] = [72, 72, 72]  # Increased from [48, 48, 48]
@@ -168,156 +168,60 @@ def load_model_once():
     
     return model, config, logger, devices
 
-def run_glianet_inference_memory_efficient(input_path: Path,
-                                          input_type: str,
-                                          output_dir: Path) -> Path:
+def run_glianet_inference_simple(input_path: Path,
+                                input_type: str,
+                                device_str: str,
+                                output_dir: Path) -> Path:
     """
-    Memory-efficient version of GLIA-Net inference
+    Simplified GLIA-Net inference using the existing infrastructure
     """
     ensure_exists(CHECKPOINT_FILE, "pretrained checkpoint")
     
-    # Get cached model
-    model, config, logger, devices = load_model_once()
+    cfg_path = GLIA_ROOT / "configs" / "inference_GLIA-Net.yaml"
+    config = _load_glia_config(cfg_path)
+    config = _ensure_ckpt_in_config(config)
+    
+    # Memory optimizations
+    config['data']['num_proc_workers'] = 0
+    config['data']['num_io_workers'] = 0
+    config['data']['overlap_step'] = [72, 72, 72]
+    config['train']['batch_size'] = 1
+    
+    logger = get_logger("GLIA-Infer", logging_folder=None, verbose=False)
+    devices = get_devices(device_str, logger)
     
     # Create test manager
     test_mgr = AneurysmSegTestManager(config, logger, devices)
     
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Load the input
-    test_mgr.load(str(input_path) if input_type == "nii" else list(input_path.rglob("*")), input_type)
+    # Create inferencer
+    infer = Inferencer(
+        config=config,
+        exp_path=str(APP_ROOT.resolve()),
+        devices=devices,
+        inference_file_or_folder=str(input_path.resolve()),
+        output_folder=str(output_dir.resolve()),
+        input_type=input_type,
+        save_binary=True,
+        save_prob=False,
+        save_global=False,
+        test_loader_manager=test_mgr,
+        logger=logger
+    )
     
-    # Get prediction shape info
-    prediction_instance_shape = test_mgr.instance_shape
-    prediction_patch_starts = test_mgr.patch_starts
-    prediction_patch_size = test_mgr.patch_size
-    
-    # If too many patches, subsample for memory efficiency
-    MAX_PATCHES = 300  # Limit for Streamlit Cloud
-    if len(prediction_patch_starts) > MAX_PATCHES:
-        st.warning(f"⚠️ Large volume detected ({len(prediction_patch_starts)} patches). Subsampling to {MAX_PATCHES} patches for memory efficiency. Results may be less accurate.")
-        # Subsample patches evenly
-        indices = np.linspace(0, len(prediction_patch_starts)-1, MAX_PATCHES, dtype=int)
-        prediction_patch_starts = [prediction_patch_starts[i] for i in indices]
-    
-    # Initialize prediction arrays
-    prediction = np.zeros(prediction_instance_shape.tolist(), dtype=np.float32)
-    overlap_count = np.zeros(prediction_instance_shape.tolist(), dtype=np.float32)
-    
-    # Process patches in small batches to save memory
-    BATCH_SIZE = 1  # Process one patch at a time
-    
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    with torch.no_grad():
-        for i in range(0, len(prediction_patch_starts), BATCH_SIZE):
-            batch_end = min(i + BATCH_SIZE, len(prediction_patch_starts))
-            batch_starts = prediction_patch_starts[i:batch_end]
-            
-            # Update progress
-            progress = i / len(prediction_patch_starts)
-            progress_bar.progress(progress)
-            status_text.text(f"Processing patch {i+1}/{len(prediction_patch_starts)}...")
-            
-            # Process batch
-            for patch_idx, patch_start in enumerate(batch_starts):
-                # Create a mini data loader for this patch
-                patch_data = test_mgr._gen_patch(patch_start)
-                if patch_data is None:
-                    continue
-                    
-                inputs, meta = patch_data
-                
-                # Prepare inputs
-                for key in inputs:
-                    inputs[key] = torch.from_numpy(inputs[key]).unsqueeze(0).to(devices[0])
-                
-                # Get model output
-                if config['model'].get('with_global', False):
-                    # Handle global model
-                    local_input = inputs['cta_img']
-                    global_input = inputs.get('global_cta_img', local_input)
-                    global_bbox = inputs.get('global_patch_location_bbox', torch.zeros(1, 6))
-                    
-                    outputs = model((local_input, global_input, global_bbox))
-                    if isinstance(outputs, tuple):
-                        main_output = outputs[0]
-                    else:
-                        main_output = outputs
-                else:
-                    # Standard model
-                    outputs = model(inputs['cta_img'])
-                    main_output = outputs
-                
-                # Apply softmax and get foreground channel
-                main_output = torch.nn.functional.softmax(main_output, dim=1)
-                main_output = main_output[:, 1].cpu().numpy()[0]  # Get foreground probability
-                
-                # Add to prediction
-                patch_ends = [patch_start[j] + prediction_patch_size[j] for j in range(3)]
-                prediction[patch_start[0]:patch_ends[0], 
-                          patch_start[1]:patch_ends[1],
-                          patch_start[2]:patch_ends[2]] += main_output
-                overlap_count[patch_start[0]:patch_ends[0],
-                             patch_start[1]:patch_ends[1],
-                             patch_start[2]:patch_ends[2]] += 1
-                
-                # Clean up
-                del inputs, outputs, main_output
-                torch.cuda.empty_cache() if torch.cuda.is_available() else None
-                gc.collect()
-    
-    progress_bar.progress(1.0)
-    status_text.text("Finalizing prediction...")
-    
-    # Average overlapping predictions
-    overlap_count = np.where(overlap_count == 0, np.ones_like(overlap_count), overlap_count)
-    prediction = prediction / overlap_count
-    
-    # Restore spacing if needed
-    prediction = test_mgr.restore_spacing(prediction, is_mask=False)
-    
-    # Apply threshold to get binary mask
-    binary_prediction = (prediction > 0.5).astype(np.int32)
-    
-    # Save prediction
-    output_file = output_dir / "prediction.nii.gz"
-    test_mgr.save_prediction(binary_prediction, str(output_file))
+    # Run inference
+    infer.inference()
     
     # Clean up
-    progress_bar.empty()
-    status_text.empty()
-    del prediction, overlap_count, binary_prediction
+    del infer
     gc.collect()
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
     
-    return output_file
-
-# Add this method to AneurysmSegTestManager if not present
-def _gen_patch(self, starts):
-    """Generate a single patch for inference"""
-    if not hasattr(self, 'img') or self.img is None:
-        return None
-        
-    input_glo_img = self.img['data']
-    brain_mask_glo_img = np.ones(self.img['size'], np.int32)
-    
-    ends = [starts[i] + self.patch_size[i] for i in range(3)]
-    patch_cta_img = input_glo_img[starts[0]:ends[0], starts[1]:ends[1], starts[2]:ends[2]].copy()
-    patch_brain_mask_img = brain_mask_glo_img[starts[0]:ends[0], starts[1]:ends[1], starts[2]:ends[2]].copy()
-    
-    inputs = {'cta_img': patch_cta_img, 'brain_mask': patch_brain_mask_img}
-    
-    if self.with_global:
-        # Simplified global handling
-        inputs['global_cta_img'] = patch_cta_img  # Use same as local for simplicity
-        inputs['global_patch_location_bbox'] = np.array([0, 0, 0, 1, 1, 1], dtype=np.float32)
-    
-    meta = {'patch_starts': np.asarray(starts)}
-    return inputs, meta
-
-# Monkey-patch the method
-AneurysmSegTestManager._gen_patch = _gen_patch
+    pred_path = _resolve_output_path(output_dir)
+    if pred_path is None or not pred_path.exists():
+        raise RuntimeError("GLIA‑Net did not produce a prediction file.")
+    return pred_path
 
 # ------------------------------ IO Utils ------------------------------
 def find_dicom_directory(root_path: Path) -> Path:
@@ -327,42 +231,72 @@ def find_dicom_directory(root_path: Path) -> Path:
     """
     reader = sitk.ImageSeriesReader()
     
-    # Try the root directory first
+    # First, check if root_path itself contains DICOM files
     try:
-        series_ids = reader.GetGDCMSeriesIDs(str(root_path))
-        if series_ids:
-            return root_path
-    except:
-        pass
+        # Check if there are any files (not directories) in root_path
+        files_in_root = [f for f in root_path.iterdir() if f.is_file()]
+        if files_in_root:
+            series_ids = reader.GetGDCMSeriesIDs(str(root_path))
+            if series_ids:
+                return root_path
+    except Exception as e:
+        st.info(f"Root directory check: {str(e)}")
     
-    # Search recursively in subdirectories
+    # If not, search subdirectories (depth-first)
+    subdirs = sorted([d for d in root_path.iterdir() if d.is_dir()])
+    
+    for subdir in subdirs:
+        try:
+            # Check if this subdirectory has files
+            files_in_subdir = [f for f in subdir.iterdir() if f.is_file()]
+            if files_in_subdir:
+                series_ids = reader.GetGDCMSeriesIDs(str(subdir))
+                if series_ids:
+                    st.info(f"📁 Found DICOM series in: {subdir.name}")
+                    return subdir
+        except Exception as e:
+            continue
+    
+    # If still not found, do a deeper recursive search
     for item in root_path.rglob("*"):
         if item.is_dir():
             try:
-                series_ids = reader.GetGDCMSeriesIDs(str(item))
-                if series_ids:
-                    return item
-            except:
+                # Check if this directory has files
+                files_in_dir = [f for f in item.iterdir() if f.is_file()]
+                if files_in_dir:
+                    series_ids = reader.GetGDCMSeriesIDs(str(item))
+                    if series_ids:
+                        st.info(f"📁 Found DICOM series in: {item.relative_to(root_path)}")
+                        return item
+            except Exception as e:
                 continue
     
-    # If no DICOM directory found, show what's in the zip for debugging
+    # If no DICOM directory found, show diagnostic info
     all_files = list(root_path.rglob("*"))
-    file_extensions = {f.suffix.lower() for f in all_files if f.is_file()}
+    file_list = [f for f in all_files if f.is_file()]
+    dir_list = [d for d in all_files if d.is_dir()]
+    
+    # Check first few files to see what we have
+    sample_files = file_list[:5] if file_list else []
+    file_info = []
+    for f in sample_files:
+        file_info.append(f"{f.name} ({f.stat().st_size / 1024:.1f} KB)")
+    
     st.error(f"""
     ❌ **No DICOM series found in the uploaded zip file.**
     
     **Debug info:**
-    - Total files found: {len([f for f in all_files if f.is_file()])}
-    - File extensions found: {', '.join(sorted(file_extensions)) if file_extensions else 'None'}
-    - Directory structure: {len([f for f in all_files if f.is_dir()])} subdirectories
+    - Total files found: {len(file_list)}
+    - Total directories found: {len(dir_list)}
+    - Sample files: {', '.join(file_info) if file_info else 'None'}
     
-    **Expected:**
-    - DICOM files (usually .dcm extension or no extension)
-    - Files should be readable by SimpleITK's GDCM reader
+    **Directory structure:**
+    {chr(10).join(['  - ' + str(d.relative_to(root_path)) for d in dir_list[:10]])}
     
     **Troubleshooting:**
-    - Make sure your zip contains actual DICOM files from a CTA study
-    - Try uploading as individual NIfTI (.nii.gz) instead if you have that format
+    - Make sure your zip contains actual DICOM files
+    - DICOM files often have .dcm extension or no extension
+    - Try uploading as NIfTI (.nii.gz) if you have that format
     """)
     st.stop()
 
@@ -381,6 +315,7 @@ def read_patient_image(input_kind: str, path: Path) -> sitk.Image:
         reader.SetMetaDataDictionaryArrayUpdate(True)
         reader.SetLoadPrivateTags(False)
         
+        # Get list of DICOM files
         series_ids = reader.GetGDCMSeriesIDs(str(dicom_dir))
         
         if not series_ids:
@@ -390,6 +325,13 @@ def read_patient_image(input_kind: str, path: Path) -> sitk.Image:
             st.info(f"ℹ️ Found {len(series_ids)} series in {dicom_dir.name}; using the first one.")
         
         file_names = reader.GetGDCMSeriesFileNames(str(dicom_dir), series_ids[0])
+        
+        # Filter out any directories that might have been picked up
+        file_names = [f for f in file_names if Path(f).is_file()]
+        
+        if not file_names:
+            raise RuntimeError(f"No valid DICOM files found in series {series_ids[0]}")
+        
         reader.SetFileNames(file_names)
         
         try:
@@ -398,6 +340,8 @@ def read_patient_image(input_kind: str, path: Path) -> sitk.Image:
             return img
         except Exception as e:
             st.error(f"❌ Failed to read DICOM series: {str(e)}")
+            # Try to provide more info
+            st.info(f"First file attempted: {file_names[0] if file_names else 'None'}")
             raise
             
     elif input_kind == "nii":
@@ -659,7 +603,7 @@ if dicom_zip is not None and in_kind.startswith("DICOM"):
         with zipfile.ZipFile(io.BytesIO(dicom_zip.getvalue())) as zf:
             zf.extractall(series_dir)
             extracted_files = zf.namelist()
-            st.info(f"📂 Extracted {len(extracted_files)} files")
+            st.info(f"📂 Extracted {len(extracted_files)} files/folders")
         
         # Load image via SITK series reader
         img = read_patient_image("dcm_dir", series_dir)
@@ -745,7 +689,7 @@ with left:
 
         img_u8 = window_ct(vol[z], wl, ww)
         rgb = draw_overlay(img_u8, mask_slice, lesions_here=lesions_here, show_boxes=show_boxes)
-        # FIXED: Updated to newest Streamlit API
+        # Updated to newest Streamlit API
         st.image(rgb, caption=f"Axial slice {z}", width="stretch")
 
 with right:
@@ -764,19 +708,24 @@ with right:
     # Run inference
     if run_infer and st.session_state.vol_np is not None:
         try:
-            with st.spinner(f"Running GLIA‑Net on CPU… This may take several minutes."):
+            with st.spinner(f"Running GLIA‑Net on CPU… This may take 5-10 minutes."):
                 case_dir = Path(st.session_state.case_dir or tempfile.mkdtemp(prefix="cta_case_"))
                 out_dir = case_dir / "preds"
                 inp_kind = st.session_state.input_kind
+                
+                # Prepare input path based on type
                 if inp_kind == "dcm_dir":
-                    input_path = Path(case_dir) / "dicom_series"
+                    # Find the actual DICOM directory
+                    series_base = Path(case_dir) / "dicom_series"
+                    dicom_dir = find_dicom_directory(series_base)
+                    input_path = dicom_dir
                     input_type = "dcm"
                 else:
                     input_path = Path(case_dir) / "input.nii.gz"
                     input_type = "nii"
                 
-                # Use memory-efficient version
-                pred_path = run_glianet_inference_memory_efficient(input_path, input_type, out_dir)
+                # Use simpler inference that leverages existing GLIA-Net code
+                pred_path = run_glianet_inference_simple(input_path, input_type, "cpu", out_dir)
                 st.session_state.pred_path = str(pred_path)
 
             # Load predicted mask and align to patient grid if needed
@@ -805,10 +754,16 @@ with right:
                     _, lesions = components_3d(st.session_state.mask_np, st.session_state.spacing_zyx)
 
                 st.session_state.lesions = lesions
+                st.success("✅ Analysis complete!")
 
         except Exception as e:
             st.exception(e)
-            st.error("Inference failed. Try uploading a smaller volume or NIfTI format.")
+            st.error("""
+            ❌ Inference failed. Common issues:
+            - Memory limits exceeded (try a smaller volume)
+            - Invalid DICOM format (try NIfTI instead)
+            - Corrupted files (re-export from your imaging software)
+            """)
 
     # Results
     if st.session_state.mask_np is not None:
@@ -841,13 +796,13 @@ with st.expander("ℹ️ Help & Notes"):
     st.markdown(
         """
 - **Inputs**: Upload either a **DICOM .zip** (one series) or a **NIfTI** file of your CTA.
-- **Inference**: Click **Run GLIA‑Net**. Processing may take several minutes on CPU.
-- **Memory Limits**: For large volumes (>300 patches), the app automatically subsamples to prevent memory issues.
-- **Atlas labels**: When enabled, the app affine‑registers the atlas to label territories (ACA/MCA/PCA/VB).
+- **Processing Time**: Expect 5-10 minutes for analysis on CPU.
+- **Memory Limits**: Large volumes may fail due to Streamlit Cloud's memory limits. Try NIfTI format for better compression.
+- **Atlas labels**: When enabled, labels territories as ACA/MCA/PCA/VB.
 - **Display**: Use the **Axial slice** slider to scroll. Red = mask contour; green = lesion box with ID.
 - **Troubleshooting**:
-  - If inference fails, try uploading a smaller volume or use NIfTI format
-  - The app is optimized for Streamlit Cloud's memory limits
-  - Processing time depends on volume size (typically 2-10 minutes)
+  - If DICOM fails, ensure the zip contains actual DICOM files (not just folders)
+  - Try NIfTI format if DICOM continues to fail
+  - For very large volumes, consider downsampling before upload
 """
     )
