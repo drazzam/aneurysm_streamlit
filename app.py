@@ -1,23 +1,11 @@
-# ---------------------------------------------------------------------
-# What this app does:
-# 1) Accepts a DICOM series (.zip) or NIfTI (.nii/.nii.gz) CTA.
-# 2) Runs GLIA‑Net (pretrained) to produce a 3D aneurysm mask.
-# 3) Lets you scroll the study and see mask overlays.
-# 4) Affine‑registers an arterial territories atlas (MNI) and annotates each lesion with a territory label.
-#
-# Folder expectations (relative to this file):
-#   PRETRAINED/checkpoint-0245700.pt
-#   ATLAS/ArterialAtlasLables.txt
-#   ATLAS/ArterialAtlas_level2.nii
-#   ATLAS/ArterialAtlas.nii
-#   ATLAS/ProbArterialAtlas_average.nii
-#   glianet/ ... (or GLIA-Net/ or GLIA-Net-master/) — the GLIA-Net repo code
-#
-# Requirements (in requirements.txt):
-# streamlit, torch, numpy, nibabel, SimpleITK, scikit-image, pyyaml, colorlog,
-# tensorboardX, opencv-python-headless, pandas, pydicom
-#
-# ---------------------------------------------------------------------
+#!/usr/bin/env python3
+"""
+CTA Aneurysm Detection - GLIA-Net + Arterial Atlas
+Complete Gradio app for Hugging Face Spaces deployment
+
+This app detects intracranial aneurysms in CTA images using GLIA-Net
+and provides arterial territory labeling using an anatomical atlas.
+"""
 
 import os
 import io
@@ -31,16 +19,15 @@ import zipfile
 import tempfile
 import numpy as np
 import pandas as pd
-import streamlit as st
+import gradio as gr
 import SimpleITK as sitk
 from pathlib import Path
 from skimage.measure import label, regionprops
 import gc
 import torch
+import traceback
 
-# ----------------------------- App Config -----------------------------
-st.set_page_config(page_title="CTA Aneurysm — GLIA‑Net + Atlas Labels", layout="wide")
-
+# ----------------------------- App Configuration -----------------------------
 APP_ROOT = Path.cwd()
 ATLAS_DIR = APP_ROOT / "ATLAS"
 PRETRAINED_DIR = APP_ROOT / "PRETRAINED"
@@ -48,29 +35,20 @@ CHECKPOINT_FILE = PRETRAINED_DIR / "checkpoint-0245700.pt"
 OUTPUTS_BASE = APP_ROOT / "outputs"
 OUTPUTS_BASE.mkdir(exist_ok=True, parents=True)
 
-# ------------------------- Utility: UI Helpers ------------------------
-def ui_badge(text, color="#0f766e"):
-    st.markdown(
-        f"""<span style="background:{color};color:white;padding:2px 8px;border-radius:6px;font-size:0.8rem">{text}</span>""",
-        unsafe_allow_html=True,
-    )
-
-def ensure_exists(path: Path, what: str):
-    if not path.exists():
-        st.error(f"❌ Missing **{what}** at: `{path}`")
-        st.stop()
-
-# ------------------------- Locate GLIA‑Net Code -----------------------
+# ----------------------------- Locate GLIA‑Net Code -------------------------
 def find_glia_root() -> Path | None:
+    """Locate the GLIA-Net source code directory."""
     candidates = [
         APP_ROOT / "glianet",
-        APP_ROOT / "GLIA-Net",
+        APP_ROOT / "GLIA-Net", 
         APP_ROOT / "GLIA-Net-master",
     ]
-    # also scan subdirs with GLIA in name
+    
+    # Also scan for any directory with GLIA in the name
     for p in APP_ROOT.iterdir():
         if p.is_dir() and "GLIA" in p.name.upper():
             candidates.append(p)
+    
     for c in candidates:
         if (c / "inference.py").exists() and (c / "utils" / "project_utils.py").exists():
             return c.resolve()
@@ -78,124 +56,181 @@ def find_glia_root() -> Path | None:
 
 GLIA_ROOT = find_glia_root()
 if GLIA_ROOT is None:
-    st.error("❌ Could not locate the GLIA‑Net repo folder. Place it as `glianet/`, `GLIA-Net/`, or `GLIA-Net-master/` next to this app.")
-    st.stop()
+    raise RuntimeError("❌ Could not locate GLIA-Net repo folder. Expected 'glianet/' directory.")
 
+# Add to Python path
 sys.path.insert(0, str(GLIA_ROOT))
 
-# Now import GLIA‑Net internals
+# Import GLIA-Net modules
 try:
     from utils.project_utils import load_config, get_logger, get_devices
     from core import Inferencer
     from data_loader import AneurysmSegTestManager
     import torch
 except Exception as e:
-    st.exception(e)
-    st.error("❌ Failed to import GLIA‑Net internals from the repo. Make sure the repo is complete.")
-    st.stop()
+    raise RuntimeError(f"❌ Failed to import GLIA-Net modules: {e}")
 
-# --------------------------- GLIA‑Net Runner --------------------------
-def _load_glia_config(cfg_path: Path):
-    # Use GLIA's loader if present; otherwise use yaml.safe_load
-    if cfg_path.exists():
-        try:
-            cfg = load_config(str(cfg_path))
-        except Exception:
-            with open(cfg_path, "r") as f:
-                cfg = yaml.safe_load(f)
-    else:
-        st.error(f"❌ Missing GLIA config YAML at {cfg_path}")
-        st.stop()
-    # Normalize to dict-like
+# ----------------------------- Utility Functions ----------------------------
+def ensure_exists(path: Path, what: str):
+    """Ensure a required file/directory exists."""
+    if not path.exists():
+        raise FileNotFoundError(f"Missing {what} at: {path}")
+
+def find_dicom_directory(root_path: Path) -> Path:
+    """Recursively search for a directory containing DICOM files."""
+    reader = sitk.ImageSeriesReader()
+    
+    # Check if root_path itself contains DICOM files
     try:
-        _ = cfg.get("ckpt_folder", None)  # DotMap & dict both support get
-    except AttributeError:
-        # wrap it so .get exists
-        cfg = dict(cfg)
-    return cfg
+        files_in_root = [f for f in root_path.iterdir() if f.is_file()]
+        if files_in_root:
+            series_ids = reader.GetGDCMSeriesIDs(str(root_path))
+            if series_ids:
+                return root_path
+    except Exception:
+        pass
+    
+    # Search subdirectories recursively
+    for item in root_path.rglob("*"):
+        if item.is_dir():
+            try:
+                files_in_dir = [f for f in item.iterdir() if f.is_file()]
+                if files_in_dir:
+                    series_ids = reader.GetGDCMSeriesIDs(str(item))
+                    if series_ids:
+                        return item
+            except Exception:
+                continue
+    
+    raise RuntimeError(f"No DICOM series found in the uploaded zip file")
 
-def _ensure_ckpt_in_config(config: dict):
-    # Ensure checkpoint entries exist and point to PRETRAINED/checkpoint-0245700.pt
-    ckpt_folder = str(PRETRAINED_DIR)
-    ckpt_file = CHECKPOINT_FILE.name
-    config["ckpt_folder"] = ckpt_folder
-    config["ckpt_file"] = ckpt_file
-    return config
+def read_patient_image(input_kind: str, path: Path) -> sitk.Image:
+    """Read DICOM series or NIfTI file and return SimpleITK image."""
+    if input_kind == "dcm_dir":
+        dicom_dir = find_dicom_directory(path)
+        reader = sitk.ImageSeriesReader()
+        reader.SetGlobalWarningDisplay(False)
+        reader.SetMetaDataDictionaryArrayUpdate(True)
+        reader.SetLoadPrivateTags(False)
+        
+        series_ids = reader.GetGDCMSeriesIDs(str(dicom_dir))
+        if not series_ids:
+            raise RuntimeError(f"No DICOM series found in {dicom_dir}")
+        
+        if len(series_ids) > 1:
+            print(f"Found {len(series_ids)} series, using the first one")
+        
+        file_names = reader.GetGDCMSeriesFileNames(str(dicom_dir), series_ids[0])
+        file_names = [f for f in file_names if Path(f).is_file()]
+        
+        if not file_names:
+            raise RuntimeError("No valid DICOM files found in the series")
+        
+        reader.SetFileNames(file_names)
+        try:
+            img = reader.Execute()
+            print(f"✅ Successfully loaded DICOM series with {len(file_names)} slices")
+            return img
+        except Exception as e:
+            raise RuntimeError(f"Failed to read DICOM series: {str(e)}")
+            
+    elif input_kind == "nii":
+        try:
+            img = sitk.ReadImage(str(path))
+            print(f"✅ Successfully loaded NIfTI file: {path.name}")
+            return img
+        except Exception as e:
+            raise RuntimeError(f"Failed to read NIfTI file: {str(e)}")
+    else:
+        raise ValueError("input_kind must be 'dcm_dir' or 'nii'")
 
-def _resolve_output_path(output_dir: Path) -> Path | None:
-    # Grab the newest .nii or .nii.gz from output_dir
-    cands = list(output_dir.glob("*.nii")) + list(output_dir.glob("*.nii.gz"))
-    if not cands:
-        return None
-    return max(cands, key=lambda p: p.stat().st_mtime)
+def sitk_to_numpy_and_spacing(img: sitk.Image):
+    """Convert SimpleITK image to numpy array and extract spacing."""
+    arr = sitk.GetArrayFromImage(img).astype(np.float32)  # [Z,Y,X]
+    sx, sy, sz = img.GetSpacing()  # SimpleITK spacing order is (X,Y,Z)
+    spacing_zyx = (sz, sy, sx)  # Convert to (Z,Y,X) order for numpy array
+    return arr, spacing_zyx
 
-@st.cache_resource(show_spinner=False)
-def load_model_once():
-    """Load the model once and cache it"""
+def window_ct(img_array: np.ndarray, wl=40.0, ww=400.0) -> np.ndarray:
+    """Apply windowing to CT image for display."""
+    lo, hi = wl - ww/2.0, wl + ww/2.0
+    v = np.clip(img_array, lo, hi)
+    v = (v - lo) / max(hi - lo, 1e-6)
+    return (v * 255.0).astype(np.uint8)
+
+def components_3d(mask_np: np.ndarray, spacing_zyx):
+    """Extract 3D connected components and compute properties."""
+    lab = label(mask_np > 0, connectivity=1)
+    props = regionprops(lab)
+    lesions = []
+    dz, dy, dx = spacing_zyx
+    
+    for p in props:
+        zc, yc, xc = p.centroid
+        vol_mm3 = float(p.area) * dz * dy * dx
+        equiv_d = ((6.0 * vol_mm3 / np.pi) ** (1.0 / 3.0))
+        lesions.append({
+            "id": int(p.label),
+            "centroid_zyx": (float(zc), float(yc), float(xc)),
+            "bbox_zyx": tuple(int(v) for v in p.bbox),
+            "volume_mm3": float(vol_mm3),
+            "equiv_diam_mm": float(equiv_d)
+        })
+    return lab, lesions
+
+def draw_overlay(gray_u8: np.ndarray, mask_slice: np.ndarray, lesions_here=None) -> np.ndarray:
+    """Draw mask contours and lesion bounding boxes on grayscale image."""
+    rgb = cv2.cvtColor(gray_u8, cv2.COLOR_GRAY2BGR)
+    
+    # Draw mask contours in red
+    m = (mask_slice > 0).astype(np.uint8) * 255
+    if m.any():
+        contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(rgb, contours, -1, (0, 0, 255), 2)  # Red contours
+    
+    # Draw lesion bounding boxes and labels in green
+    if lesions_here:
+        for L in lesions_here:
+            y0, x0 = int(L["bbox_zyx"][1]), int(L["bbox_zyx"][2])
+            y1, x1 = int(L["bbox_zyx"][4]-1), int(L["bbox_zyx"][5]-1)
+            cv2.rectangle(rgb, (x0, y0), (x1, y1), (0, 255, 0), 2)
+            
+            label_txt = f"ID {L['id']}"
+            if "territory_name" in L and L["territory_name"]:
+                label_txt += f" • {L['territory_name']}"
+            
+            cv2.putText(rgb, label_txt, (x0, max(15, y0-5)), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2, cv2.LINE_AA)
+    
+    return rgb
+
+# ----------------------------- GLIA-Net Inference ----------------------------
+def run_glianet_inference(input_path: Path, input_type: str, output_dir: Path) -> Path:
+    """Run GLIA-Net inference and return path to prediction file."""
+    ensure_exists(CHECKPOINT_FILE, "GLIA-Net checkpoint")
+    
+    # Load and modify config
     cfg_path = GLIA_ROOT / "configs" / "inference_GLIA-Net.yaml"
-    config = _load_glia_config(cfg_path)
-    config = _ensure_ckpt_in_config(config)
+    config = load_config(cfg_path)
     
-    # CRITICAL: Memory optimizations for Streamlit Cloud
-    config['data']['num_proc_workers'] = 0
-    config['data']['num_io_workers'] = 0  # Set to 0 to avoid multiprocessing issues
+    # Update config for our setup
+    config['ckpt_folder'] = str(PRETRAINED_DIR)
+    config['ckpt_file'] = CHECKPOINT_FILE.name
     
-    # CRITICAL: Reduce patch overlap to reduce number of patches
-    config['data']['overlap_step'] = [72, 72, 72]  # Increased from [48, 48, 48]
-    
-    # Reduce batch size
-    config['train']['batch_size'] = 1
-    
-    logger = get_logger("GLIA-Infer", logging_folder=None, verbose=False)
-    
-    # Force CPU
-    device_str = "cpu"
-    devices = get_devices(device_str, logger)
-    
-    # Create model
-    from utils.model_utils import get_model
-    model = get_model(config, logger)
-    
-    # Load checkpoint with map_location to CPU
-    checkpoint = torch.load(str(CHECKPOINT_FILE), map_location=torch.device('cpu'))
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.to(devices[0])
-    model.eval()
-    
-    # Clear checkpoint from memory
-    del checkpoint
-    gc.collect()
-    
-    return model, config, logger, devices
-
-def run_glianet_inference_simple(input_path: Path,
-                                input_type: str,
-                                device_str: str,
-                                output_dir: Path) -> Path:
-    """
-    Simplified GLIA-Net inference using the existing infrastructure
-    """
-    ensure_exists(CHECKPOINT_FILE, "pretrained checkpoint")
-    
-    cfg_path = GLIA_ROOT / "configs" / "inference_GLIA-Net.yaml"
-    config = _load_glia_config(cfg_path)
-    config = _ensure_ckpt_in_config(config)
-    
-    # Memory optimizations
+    # Memory optimizations for Hugging Face Spaces
     config['data']['num_proc_workers'] = 0
     config['data']['num_io_workers'] = 0
-    config['data']['overlap_step'] = [72, 72, 72]
+    config['data']['overlap_step'] = [72, 72, 72]  # Larger overlap to reduce patches
     config['train']['batch_size'] = 1
     
     logger = get_logger("GLIA-Infer", logging_folder=None, verbose=False)
-    devices = get_devices(device_str, logger)
+    devices = get_devices("cpu", logger)  # Force CPU for stability
     
-    # Create test manager
+    # Create test manager and output directory
     test_mgr = AneurysmSegTestManager(config, logger, devices)
-    
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Create inferencer
+    # Create and run inferencer
     infer = Inferencer(
         config=config,
         exp_path=str(APP_ROOT.resolve()),
@@ -210,599 +245,527 @@ def run_glianet_inference_simple(input_path: Path,
         logger=logger
     )
     
-    # Run inference
     infer.inference()
     
-    # Clean up
-    del infer
+    # Clean up memory
+    del infer, test_mgr
     gc.collect()
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     
-    pred_path = _resolve_output_path(output_dir)
-    if pred_path is None or not pred_path.exists():
-        raise RuntimeError("GLIA‑Net did not produce a prediction file.")
-    return pred_path
+    # Find and return prediction file
+    pred_files = list(output_dir.glob("*.nii")) + list(output_dir.glob("*.nii.gz"))
+    if not pred_files:
+        raise RuntimeError("GLIA-Net inference did not produce any prediction files")
+    
+    return max(pred_files, key=lambda p: p.stat().st_mtime)
 
-# ------------------------------ IO Utils ------------------------------
-def find_dicom_directory(root_path: Path) -> Path:
-    """
-    Recursively search for a directory containing DICOM files.
-    Returns the first directory found that contains DICOM series.
-    """
-    reader = sitk.ImageSeriesReader()
+# ----------------------------- Atlas Integration ----------------------------
+def parse_labels_txt(path: Path) -> dict:
+    """Parse atlas labels file."""
+    lut = {1: "ACA", 2: "MCA", 3: "PCA", 4: "Vertebro-Basilar"}  # Default fallback
     
-    # First, check if root_path itself contains DICOM files
-    try:
-        # Check if there are any files (not directories) in root_path
-        files_in_root = [f for f in root_path.iterdir() if f.is_file()]
-        if files_in_root:
-            series_ids = reader.GetGDCMSeriesIDs(str(root_path))
-            if series_ids:
-                return root_path
-    except Exception as e:
-        st.info(f"Root directory check: {str(e)}")
-    
-    # If not, search subdirectories (depth-first)
-    subdirs = sorted([d for d in root_path.iterdir() if d.is_dir()])
-    
-    for subdir in subdirs:
-        try:
-            # Check if this subdirectory has files
-            files_in_subdir = [f for f in subdir.iterdir() if f.is_file()]
-            if files_in_subdir:
-                series_ids = reader.GetGDCMSeriesIDs(str(subdir))
-                if series_ids:
-                    st.info(f"📁 Found DICOM series in: {subdir.name}")
-                    return subdir
-        except Exception as e:
-            continue
-    
-    # If still not found, do a deeper recursive search
-    for item in root_path.rglob("*"):
-        if item.is_dir():
-            try:
-                # Check if this directory has files
-                files_in_dir = [f for f in item.iterdir() if f.is_file()]
-                if files_in_dir:
-                    series_ids = reader.GetGDCMSeriesIDs(str(item))
-                    if series_ids:
-                        st.info(f"📁 Found DICOM series in: {item.relative_to(root_path)}")
-                        return item
-            except Exception as e:
-                continue
-    
-    # If no DICOM directory found, show diagnostic info
-    all_files = list(root_path.rglob("*"))
-    file_list = [f for f in all_files if f.is_file()]
-    dir_list = [d for d in all_files if d.is_dir()]
-    
-    # Check first few files to see what we have
-    sample_files = file_list[:5] if file_list else []
-    file_info = []
-    for f in sample_files:
-        file_info.append(f"{f.name} ({f.stat().st_size / 1024:.1f} KB)")
-    
-    st.error(f"""
-    ❌ **No DICOM series found in the uploaded zip file.**
-    
-    **Debug info:**
-    - Total files found: {len(file_list)}
-    - Total directories found: {len(dir_list)}
-    - Sample files: {', '.join(file_info) if file_info else 'None'}
-    
-    **Directory structure:**
-    {chr(10).join(['  - ' + str(d.relative_to(root_path)) for d in dir_list[:10]])}
-    
-    **Troubleshooting:**
-    - Make sure your zip contains actual DICOM files
-    - DICOM files often have .dcm extension or no extension
-    - Try uploading as NIfTI (.nii.gz) if you have that format
-    """)
-    st.stop()
-
-def read_patient_image(input_kind: str, path: Path) -> sitk.Image:
-    """
-    input_kind: "dcm_dir" (folder with one DICOM series) or "nii" (single file)
-    Returns a SimpleITK 3D image in patient space.
-    """
-    if input_kind == "dcm_dir":
-        # Find the actual directory containing DICOM files
-        dicom_dir = find_dicom_directory(path)
-        
-        reader = sitk.ImageSeriesReader()
-        # Set GDCM to be less strict
-        reader.SetGlobalWarningDisplay(False)
-        reader.SetMetaDataDictionaryArrayUpdate(True)
-        reader.SetLoadPrivateTags(False)
-        
-        # Get list of DICOM files
-        series_ids = reader.GetGDCMSeriesIDs(str(dicom_dir))
-        
-        if not series_ids:
-            raise RuntimeError(f"No DICOM series found in {dicom_dir}")
-        
-        if len(series_ids) > 1:
-            st.info(f"ℹ️ Found {len(series_ids)} series in {dicom_dir.name}; using the first one.")
-        
-        file_names = reader.GetGDCMSeriesFileNames(str(dicom_dir), series_ids[0])
-        
-        # Filter out any directories that might have been picked up
-        file_names = [f for f in file_names if Path(f).is_file()]
-        
-        if not file_names:
-            raise RuntimeError(f"No valid DICOM files found in series {series_ids[0]}")
-        
-        reader.SetFileNames(file_names)
-        
-        try:
-            img = reader.Execute()
-            st.success(f"✅ Successfully loaded DICOM series with {len(file_names)} slices from {dicom_dir.name}")
-            return img
-        except Exception as e:
-            st.error(f"❌ Failed to read DICOM series: {str(e)}")
-            # Try to provide more info
-            st.info(f"First file attempted: {file_names[0] if file_names else 'None'}")
-            raise
-            
-    elif input_kind == "nii":
-        try:
-            img = sitk.ReadImage(str(path))
-            st.success(f"✅ Successfully loaded NIfTI file: {path.name}")
-            return img
-        except Exception as e:
-            st.error(f"❌ Failed to read NIfTI file: {str(e)}")
-            raise
-    else:
-        raise ValueError("input_kind must be 'dcm_dir' or 'nii'.")
-
-def sitk_to_numpy_and_spacing(img: sitk.Image) -> tuple[np.ndarray, tuple[float,float,float]]:
-    arr = sitk.GetArrayFromImage(img).astype(np.float32)  # [Z,Y,X]
-    sx, sy, sz = img.GetSpacing()  # NOTE: SITK spacing order is (X,Y,Z)
-    spacing_zyx = (sz, sy, sx)
-    return arr, spacing_zyx
-
-def validate_medical_image(img: sitk.Image, vol_np: np.ndarray) -> bool:
-    """Validate that the loaded image looks like a medical CT image"""
-    try:
-        # Check dimensions
-        if img.GetDimension() != 3:
-            st.warning(f"⚠️ Expected 3D image, got {img.GetDimension()}D")
-            return False
-            
-        # Check size (reasonable for medical images)
-        size = img.GetSize()
-        if min(size) < 64 or max(size) > 2048:
-            st.warning(f"⚠️ Unusual image dimensions: {size}")
-            
-        # Check voxel values (should look like CT HU values)
-        min_val, max_val = float(vol_np.min()), float(vol_np.max())
-        if min_val > 1000 or max_val < -500:
-            st.warning(f"⚠️ Unusual intensity range: {min_val:.0f} to {max_val:.0f} (expected CT Hounsfield units)")
-            
-        # Check if image is mostly empty
-        non_zero_ratio = np.count_nonzero(vol_np) / vol_np.size
-        if non_zero_ratio < 0.1:
-            st.warning(f"⚠️ Image appears mostly empty ({non_zero_ratio*100:.1f}% non-zero voxels)")
-            
-        return True
-        
-    except Exception as e:
-        st.error(f"❌ Error validating image: {str(e)}")
-        return False
-
-def window_ct(img_u16_or_f32: np.ndarray, wl=40.0, ww=400.0) -> np.ndarray:
-    lo, hi = wl - ww/2.0, wl + ww/2.0
-    v = np.clip(img_u16_or_f32, lo, hi)
-    v = (v - lo) / max(hi - lo, 1e-6)
-    return (v * 255.0).astype(np.uint8)
-
-# ----------------------------- Overlay Utils -------------------------
-def components_3d(mask_np: np.ndarray, spacing_zyx: tuple[float,float,float]):
-    lab = label(mask_np > 0, connectivity=1)  # 6-connectivity
-    props = regionprops(lab)
-    lesions = []
-    dz, dy, dx = spacing_zyx
-    for p in props:
-        zc, yc, xc = p.centroid
-        vol_mm3 = float(p.area) * dz * dy * dx
-        equiv_d = ( (6.0 * vol_mm3 / np.pi) ** (1.0 / 3.0) )
-        lesions.append({
-            "id": int(p.label),
-            "centroid_zyx": (float(zc), float(yc), float(xc)),
-            "bbox_zyx": tuple(int(v) for v in p.bbox),  # (z0,y0,x0,z1,y1,x1)
-            "volume_mm3": float(vol_mm3),
-            "equiv_diam_mm": float(equiv_d)
-        })
-    return lab, lesions
-
-def draw_overlay(gray_u8: np.ndarray, mask_slice: np.ndarray, lesions_here=None, show_boxes=True) -> np.ndarray:
-    rgb = cv2.cvtColor(gray_u8, cv2.COLOR_GRAY2BGR)
-    m = (mask_slice > 0).astype(np.uint8) * 255
-    if m.any():
-        cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(rgb, cnts, -1, (0, 0, 255), 1)  # red contours
-    if show_boxes and lesions_here:
-        for L in lesions_here:
-            y0, x0 = int(L["bbox_zyx"][1]), int(L["bbox_zyx"][2])
-            y1, x1 = int(L["bbox_zyx"][4]-1), int(L["bbox_zyx"][5]-1)
-            cv2.rectangle(rgb, (x0,y0), (x1,y1), (0,255,0), 1)
-            label_txt = f"ID {L['id']}"
-            if "territory_name" in L and L["territory_name"]:
-                label_txt += f" • {L['territory_name']}"
-            cv2.putText(rgb, label_txt, (x0, max(12, y0-4)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,255,0), 1, cv2.LINE_AA)
-    return rgb
-
-# ---------------------------- Atlas Functions -------------------------
-def parse_labels_txt(path: Path) -> dict[int, str]:
-    lut = {}
     if not path.exists():
-        return {1: "ACA", 2: "MCA", 3: "PCA", 4: "Vertebro-Basilar"}
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            s = line.strip()
-            if not s or s.startswith("#"):
-                continue
-            # Try "ID name..." tolerant parsing
-            parts = [p for p in s.replace(",", " ").split() if p]
-            try:
-                k = int(parts[0])
-                name = " ".join(parts[1:]) if len(parts) > 1 else str(k)
-                lut[k] = name
-            except Exception:
-                continue
-    if not lut:
-        lut = {1: "ACA", 2: "MCA", 3: "PCA", 4: "Vertebro-Basilar"}
+        return lut
+    
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith("#"):
+                    continue
+                
+                # Parse line: "ID name..."
+                parts = [p for p in s.replace(",", " ").split() if p]
+                try:
+                    k = int(parts[0])
+                    name = " ".join(parts[1:]) if len(parts) > 1 else str(k)
+                    lut[k] = name
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    
     return lut
 
-@st.cache_resource(show_spinner=False)
 def load_atlas():
-    # We use ProbArterialAtlas_average.nii as the moving (intensity) image for MI registration,
-    # and ArterialAtlas_level2.nii as the discrete labelmap (nearest-neighbor resample).
+    """Load atlas files if available."""
     prob_path = ATLAS_DIR / "ProbArterialAtlas_average.nii"
     lvl2_path = ATLAS_DIR / "ArterialAtlas_level2.nii"
-    fine_path = ATLAS_DIR / "ArterialAtlas.nii"  # optional (not used by default)
     labels_path = ATLAS_DIR / "ArterialAtlasLables.txt"
-
-    ensure_exists(prob_path, "ATLAS/ProbArterialAtlas_average.nii")
-    ensure_exists(lvl2_path, "ATLAS/ArterialAtlas_level2.nii")
-    ensure_exists(labels_path, "ATLAS/ArterialAtlasLables.txt")
-
-    moving_prob = sitk.ReadImage(str(prob_path))                # float
-    atlas_lvl2 = sitk.ReadImage(str(lvl2_path), sitk.sitkUInt16)  # labels
-    atlas_fine = sitk.ReadImage(str(fine_path), sitk.sitkUInt16) if fine_path.exists() else None
-    lut = parse_labels_txt(labels_path)
-    return moving_prob, atlas_lvl2, atlas_fine, lut
-
-def affine_register_mni_to_patient(patient_img: sitk.Image, moving_mni_img: sitk.Image) -> sitk.Transform:
-    reg = sitk.ImageRegistrationMethod()
-    reg.SetMetricAsMattesMutualInformation(32)
-    reg.SetInterpolator(sitk.sitkLinear)
-    reg.SetOptimizerAsRegularStepGradientDescent(learningRate=2.0, minStep=1e-3, numberOfIterations=200)
-    reg.SetOptimizerScalesFromPhysicalShift()
-    # Multi-resolution for speed/stability
-    reg.SetShrinkFactorsPerLevel([4, 2, 1])
-    reg.SetSmoothingSigmasPerLevel([2, 1, 0])
-    reg.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
-    init = sitk.CenteredTransformInitializer(patient_img, moving_mni_img, sitk.Euler3DTransform(),
-                                             sitk.CenteredTransformInitializerFilter.GEOMETRY)
-    reg.SetInitialTransform(init, inPlace=False)
-    # moving = MNI prob, fixed = patient
-    tx = reg.Execute(patient_img, moving_mni_img)
-    return tx
-
-def resample_to_patient(moving_img: sitk.Image, fixed_img: sitk.Image, transform: sitk.Transform, is_label=False) -> sitk.Image:
-    interp = sitk.sitkNearestNeighbor if is_label else sitk.sitkLinear
-    default_val = 0 if is_label else 0.0
-    out = sitk.Resample(moving_img, fixed_img, transform, interp, default_val,
-                        sitk.sitkUInt16 if is_label else sitk.sitkFloat32)
-    return out
+    
+    # Check if all required atlas files exist
+    if not all(p.exists() for p in [prob_path, lvl2_path, labels_path]):
+        return None, None, None
+    
+    try:
+        moving_prob = sitk.ReadImage(str(prob_path))
+        atlas_lvl2 = sitk.ReadImage(str(lvl2_path), sitk.sitkUInt16)
+        lut = parse_labels_txt(labels_path)
+        return moving_prob, atlas_lvl2, lut
+    except Exception:
+        return None, None, None
 
 def annotate_with_atlas(patient_img: sitk.Image, mask_np: np.ndarray):
-    moving_prob, atlas_lvl2, _, lut = load_atlas()
-    tx = affine_register_mni_to_patient(patient_img, moving_prob)
-    atlas_in_patient = resample_to_patient(atlas_lvl2, patient_img, tx, is_label=True)
-    atlas_np = sitk.GetArrayFromImage(atlas_in_patient).astype(np.int32)
+    """Add atlas-based territory labels to lesions."""
+    # Load atlas
+    atlas_data = load_atlas()
     spacing_zyx = (patient_img.GetSpacing()[2], patient_img.GetSpacing()[1], patient_img.GetSpacing()[0])
     _, lesions = components_3d(mask_np, spacing_zyx)
-    for L in lesions:
-        z, y, x = [int(round(v)) for v in L["centroid_zyx"]]
-        z = np.clip(z, 0, atlas_np.shape[0]-1)
-        y = np.clip(y, 0, atlas_np.shape[1]-1)
-        x = np.clip(x, 0, atlas_np.shape[2]-1)
-        lbl = int(atlas_np[z, y, x])
-        L["territory_id"] = lbl
-        L["territory_name"] = lut.get(lbl, str(lbl))
+    
+    if atlas_data[0] is None:
+        # No atlas available
+        return lesions, None
+    
+    moving_prob, atlas_lvl2, lut = atlas_data
+    
+    # Perform registration (simplified for robustness)
+    try:
+        reg = sitk.ImageRegistrationMethod()
+        reg.SetMetricAsMattesMutualInformation(32)
+        reg.SetInterpolator(sitk.sitkLinear)
+        reg.SetOptimizerAsRegularStepGradientDescent(2.0, 1e-3, 200)
+        reg.SetOptimizerScalesFromPhysicalShift()
+        reg.SetShrinkFactorsPerLevel([4, 2, 1])
+        reg.SetSmoothingSigmasPerLevel([2, 1, 0])
+        reg.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
+        
+        init = sitk.CenteredTransformInitializer(
+            patient_img, moving_prob, sitk.Euler3DTransform(),
+            sitk.CenteredTransformInitializerFilter.GEOMETRY
+        )
+        reg.SetInitialTransform(init, inPlace=False)
+        
+        tx = reg.Execute(patient_img, moving_prob)
+        atlas_in_patient = sitk.Resample(atlas_lvl2, patient_img, tx, 
+                                        sitk.sitkNearestNeighbor, 0, sitk.sitkUInt16)
+        atlas_np = sitk.GetArrayFromImage(atlas_in_patient).astype(np.int32)
+        
+        # Add territory labels to lesions
+        for L in lesions:
+            z, y, x = [int(round(v)) for v in L["centroid_zyx"]]
+            z = np.clip(z, 0, atlas_np.shape[0]-1)
+            y = np.clip(y, 0, atlas_np.shape[1]-1) 
+            x = np.clip(x, 0, atlas_np.shape[2]-1)
+            lbl = int(atlas_np[z, y, x])
+            L["territory_id"] = lbl
+            L["territory_name"] = lut.get(lbl, str(lbl))
+            
+    except Exception as e:
+        print(f"Atlas registration failed: {e}")
+        atlas_np = None
+    
     return lesions, atlas_np
 
-# ---------------------------- Session State ---------------------------
-if "case_dir" not in st.session_state:
-    st.session_state.case_dir = None
-if "input_kind" not in st.session_state:
-    st.session_state.input_kind = None  # "dcm_dir" or "nii"
-if "patient_img" not in st.session_state:
-    st.session_state.patient_img = None
-if "vol_np" not in st.session_state:
-    st.session_state.vol_np = None
-if "spacing_zyx" not in st.session_state:
-    st.session_state.spacing_zyx = None
-if "pred_path" not in st.session_state:
-    st.session_state.pred_path = None
-if "mask_np" not in st.session_state:
-    st.session_state.mask_np = None
-if "lesions" not in st.session_state:
-    st.session_state.lesions = []
-if "atlas_np" not in st.session_state:
-    st.session_state.atlas_np = None
-
-# ------------------------------- Sidebar ------------------------------
-st.sidebar.header("Settings")
-ui_badge("GLIA‑Net repo", "#334155")
-st.sidebar.code(str(GLIA_ROOT), language="bash")
-
-# Device selection - Force CPU for Streamlit Cloud
-st.sidebar.info("ℹ️ Running on CPU (optimized for Streamlit Cloud)")
-
-# Input type
-in_kind = st.sidebar.radio("Input type", ["DICOM (.zip of a series)", "NIfTI (.nii/.nii.gz)"], index=0)
-
-# Uploaders
-dicom_zip = None
-nii_file = None
-if in_kind.startswith("DICOM"):
-    st.sidebar.markdown("**📁 DICOM Requirements:**")
-    st.sidebar.markdown("""
-    - Upload a .zip file containing a DICOM series
-    - Can handle nested folders within the zip
-    - Must be CTA (CT Angiography) images
-    - Typical file sizes: 50MB - 500MB
-    """)
-    dicom_zip = st.sidebar.file_uploader("Upload DICOM series (.zip)", type=["zip"])
-else:
-    st.sidebar.markdown("**🧠 NIfTI Requirements:**")
-    st.sidebar.markdown("""
-    - Upload a single .nii or .nii.gz file
-    - Must be CTA (CT Angiography) images  
-    - 3D volume expected
-    - Typical file sizes: 10MB - 100MB
-    """)
-    nii_file = st.sidebar.file_uploader("Upload NIfTI (.nii or .nii.gz)", type=["nii", "gz"])
-
-# Actions
-colA, colB = st.sidebar.columns(2)
-run_infer = colA.button("▶️ Run GLIA‑Net")
-reset_case = colB.button("🧹 Reset")
-
-# --------------------------- Reset Handling ---------------------------
-if reset_case:
-    # clean any previous temp dir
-    if st.session_state.case_dir and Path(st.session_state.case_dir).exists():
-        try:
-            shutil.rmtree(st.session_state.case_dir, ignore_errors=True)
-        except Exception:
-            pass
-    for k in ["case_dir","input_kind","patient_img","vol_np","spacing_zyx","pred_path","mask_np","lesions","atlas_np"]:
-        st.session_state[k] = None if k != "lesions" else []
-    st.rerun()
-
-# ---------------------------- Load the Study --------------------------
-if dicom_zip is not None and in_kind.startswith("DICOM"):
-    with st.spinner("Extracting and analyzing DICOM files..."):
-        # Extract to a temp case dir
-        if st.session_state.case_dir is None:
-            st.session_state.case_dir = str(Path(tempfile.mkdtemp(prefix="cta_case_")).resolve())
-        case_dir = Path(st.session_state.case_dir)
-        series_dir = case_dir / "dicom_series"
-        if series_dir.exists():
-            shutil.rmtree(series_dir, ignore_errors=True)
-        series_dir.mkdir(parents=True, exist_ok=True)
+# ----------------------------- Main Processing Function ------------------
+def process_medical_image(file_input, input_type, add_labels, wl, ww):
+    """Main processing function called by Gradio interface."""
+    if file_input is None:
+        return None, None, "❌ Please upload a file first.", None, gr.update()
+    
+    try:
+        # Create temporary directory for this case
+        case_dir = Path(tempfile.mkdtemp(prefix="cta_case_"))
         
-        # Unzip with progress info
-        zip_size = len(dicom_zip.getvalue())
-        st.info(f"📦 Processing zip file ({zip_size / 1024 / 1024:.1f} MB)...")
-        
-        with zipfile.ZipFile(io.BytesIO(dicom_zip.getvalue())) as zf:
-            zf.extractall(series_dir)
-            extracted_files = zf.namelist()
-            st.info(f"📂 Extracted {len(extracted_files)} files/folders")
-        
-        # Load image via SITK series reader
-        img = read_patient_image("dcm_dir", series_dir)
-        vol_np, spacing_zyx = sitk_to_numpy_and_spacing(img)
-        
-        # Validate the loaded image
-        if validate_medical_image(img, vol_np):
-            st.session_state.patient_img = img
-            st.session_state.vol_np = vol_np
-            st.session_state.spacing_zyx = spacing_zyx
-            st.session_state.input_kind = "dcm_dir"
-            st.session_state.pred_path = None
-            st.session_state.mask_np = None
-            st.session_state.lesions = []
-            st.session_state.atlas_np = None
-
-elif nii_file is not None and in_kind.startswith("NIfTI"):
-    with st.spinner("Loading NIfTI file..."):
-        if st.session_state.case_dir is None:
-            st.session_state.case_dir = str(Path(tempfile.mkdtemp(prefix="cta_case_")).resolve())
-        case_dir = Path(st.session_state.case_dir)
-        nii_path = case_dir / "input.nii.gz"
-        
-        # Save uploaded file
-        file_size = len(nii_file.getvalue())
-        st.info(f"💾 Processing NIfTI file ({file_size / 1024 / 1024:.1f} MB)...")
-        
-        with open(nii_path, "wb") as f:
-            f.write(nii_file.getvalue())
+        # Handle different input types
+        if input_type == "DICOM (.zip)":
+            # Extract DICOM zip file
+            series_dir = case_dir / "dicom_series"
+            series_dir.mkdir(parents=True, exist_ok=True)
             
-        # Load image
-        img = read_patient_image("nii", nii_path)
-        vol_np, spacing_zyx = sitk_to_numpy_and_spacing(img)
+            with zipfile.ZipFile(file_input.name) as zf:
+                zf.extractall(series_dir)
+            
+            img = read_patient_image("dcm_dir", series_dir)
+            input_kind = "dcm"
+            input_path = find_dicom_directory(series_dir)
+            
+        else:  # NIfTI
+            nii_path = case_dir / "input.nii.gz"
+            shutil.copy2(file_input.name, nii_path)
+            img = read_patient_image("nii", nii_path)
+            input_kind = "nii"
+            input_path = nii_path
         
-        # Validate the loaded image
-        if validate_medical_image(img, vol_np):
-            st.session_state.patient_img = img
-            st.session_state.vol_np = vol_np
-            st.session_state.spacing_zyx = spacing_zyx
-            st.session_state.input_kind = "nii"
-            st.session_state.pred_path = None
-            st.session_state.mask_np = None
-            st.session_state.lesions = []
-            st.session_state.atlas_np = None
-
-# ------------------------------- Header -------------------------------
-st.title("CTA Aneurysm — GLIA‑Net + Arterial Atlas")
-left, right = st.columns([1.1, 1])
-
-# ----------------------------- Main Viewer ----------------------------
-with left:
-    st.subheader("Study")
-    if st.session_state.vol_np is None:
-        st.info("Upload a **DICOM .zip** or a **NIfTI** to begin.")
-    else:
-        vol = st.session_state.vol_np
-        D, H, W = vol.shape
-        spacing = st.session_state.spacing_zyx
-        st.caption(f"Volume: **{D}×{H}×{W}** vox • Spacing (mm): **{spacing[0]:.2f} × {spacing[1]:.2f} × {spacing[2]:.2f}**")
-
-        # WL/WW controls
-        c1, c2, c3 = st.columns([1,1,1])
-        wl = c1.slider("Window Level (WL)", -200.0, 200.0, 40.0, 1.0)
-        ww = c2.slider("Window Width (WW)", 100.0, 3000.0, 400.0, 10.0)
-        show_boxes = c3.checkbox("Show lesion boxes & IDs", value=True)
-
-        # Slice slider
-        z = st.slider("Axial slice", 0, D-1, D//2, 1)
-
-        # Determine mask on this slice (if present)
-        mask_slice = None
-        if st.session_state.mask_np is not None and z < st.session_state.mask_np.shape[0]:
-            mask_slice = st.session_state.mask_np[z]
+        # Extract volume data and properties
+        vol_np, spacing_zyx = sitk_to_numpy_and_spacing(img)
+        D, H, W = vol_np.shape
+        
+        # Run GLIA-Net inference
+        output_dir = case_dir / "preds"
+        yield None, None, f"🔄 Running GLIA-Net inference...\n📊 Volume: {D}×{H}×{W} voxels\n⏱️ This may take 5-10 minutes", None, gr.update()
+        
+        pred_path = run_glianet_inference(input_path, input_kind, output_dir)
+        
+        # Load prediction and align with patient image
+        pred_img = sitk.ReadImage(str(pred_path))
+        if (pred_img.GetSize() != img.GetSize() or 
+            pred_img.GetSpacing() != img.GetSpacing() or
+            pred_img.GetOrigin() != img.GetOrigin() or
+            pred_img.GetDirection() != img.GetDirection()):
+            pred_img = sitk.Resample(pred_img, img, sitk.Transform(), 
+                                   sitk.sitkNearestNeighbor, 0, sitk.sitkUInt16)
+        
+        mask_np = sitk.GetArrayFromImage(pred_img).astype(np.uint8)
+        mask_np = (mask_np > 0).astype(np.uint8)
+        
+        # Analyze lesions and add atlas labels if requested
+        yield None, None, f"🔄 Analyzing detected lesions...", None, gr.update()
+        
+        if add_labels:
+            lesions, atlas_np = annotate_with_atlas(img, mask_np)
         else:
-            mask_slice = np.zeros((H, W), dtype=np.uint8)
-
-        # Filter lesions on this slice
-        lesions_here = []
-        for L in (st.session_state.lesions or []):
-            z0,y0,x0,z1,y1,x1 = L["bbox_zyx"]
-            if z0 <= z < z1:
-                lesions_here.append(L)
-
-        img_u8 = window_ct(vol[z], wl, ww)
-        rgb = draw_overlay(img_u8, mask_slice, lesions_here=lesions_here, show_boxes=show_boxes)
-        # Updated to newest Streamlit API
-        st.image(rgb, caption=f"Axial slice {z}", width="stretch")
-
-with right:
-    st.subheader("Pipeline")
-    # Show model + atlas status
-    ok_ckpt = CHECKPOINT_FILE.exists()
-    ok_atlas = all((ATLAS_DIR / name).exists() for name in ["ArterialAtlasLables.txt","ArterialAtlas_level2.nii","ProbArterialAtlas_average.nii"])
-    cols = st.columns(2)
-    cols[0].markdown("**GLIA‑Net weights**")
-    cols[0].write(("✅ Found" if ok_ckpt else "❌ Missing"))
-    cols[1].markdown("**Atlas files**")
-    cols[1].write(("✅ Found" if ok_atlas else "❌ Missing"))
-
-    add_labels = st.checkbox("Add atlas labels (ACA/MCA/PCA/VB)", value=True, disabled=not ok_atlas)
-
-    # Run inference
-    if run_infer and st.session_state.vol_np is not None:
-        try:
-            with st.spinner(f"Running GLIA‑Net on CPU… This may take 5-10 minutes."):
-                case_dir = Path(st.session_state.case_dir or tempfile.mkdtemp(prefix="cta_case_"))
-                out_dir = case_dir / "preds"
-                inp_kind = st.session_state.input_kind
-                
-                # Prepare input path based on type
-                if inp_kind == "dcm_dir":
-                    # Find the actual DICOM directory
-                    series_base = Path(case_dir) / "dicom_series"
-                    dicom_dir = find_dicom_directory(series_base)
-                    input_path = dicom_dir
-                    input_type = "dcm"
-                else:
-                    input_path = Path(case_dir) / "input.nii.gz"
-                    input_type = "nii"
-                
-                # Use simpler inference that leverages existing GLIA-Net code
-                pred_path = run_glianet_inference_simple(input_path, input_type, "cpu", out_dir)
-                st.session_state.pred_path = str(pred_path)
-
-            # Load predicted mask and align to patient grid if needed
-            with st.spinner("Loading prediction…"):
-                pred_img = sitk.ReadImage(st.session_state.pred_path)
-                patient_img = st.session_state.patient_img
-                
-                # Resample if needed
-                if pred_img.GetSize() != patient_img.GetSize() or \
-                   pred_img.GetSpacing() != patient_img.GetSpacing() or \
-                   pred_img.GetOrigin()  != patient_img.GetOrigin()  or \
-                   pred_img.GetDirection()!= patient_img.GetDirection():
-                    # Resample with identity to patient grid
-                    pred_img = sitk.Resample(pred_img, patient_img, sitk.Transform(), 
-                                           sitk.sitkNearestNeighbor, 0, sitk.sitkUInt16)
-                    
-                mask_np = sitk.GetArrayFromImage(pred_img).astype(np.uint8)
-                st.session_state.mask_np = (mask_np > 0).astype(np.uint8)
-
-            # Lesion analysis (and optional atlas)
-            with st.spinner("Computing lesion summaries…"):
-                if add_labels and ok_atlas:
-                    lesions, atlas_np = annotate_with_atlas(st.session_state.patient_img, st.session_state.mask_np)
-                    st.session_state.atlas_np = atlas_np
-                else:
-                    _, lesions = components_3d(st.session_state.mask_np, st.session_state.spacing_zyx)
-
-                st.session_state.lesions = lesions
-                st.success("✅ Analysis complete!")
-
-        except Exception as e:
-            st.exception(e)
-            st.error("""
-            ❌ Inference failed. Common issues:
-            - Memory limits exceeded (try a smaller volume)
-            - Invalid DICOM format (try NIfTI instead)
-            - Corrupted files (re-export from your imaging software)
-            """)
-
-    # Results
-    if st.session_state.mask_np is not None:
-        st.markdown("**Detections**")
-        if not st.session_state.lesions:
-            st.info("No lesions found in the prediction mask.")
-        else:
-            rows = []
-            for L in st.session_state.lesions:
-                rows.append({
+            spacing_zyx = (img.GetSpacing()[2], img.GetSpacing()[1], img.GetSpacing()[0])
+            _, lesions = components_3d(mask_np, spacing_zyx)
+            atlas_np = None
+        
+        # Create results table
+        if lesions:
+            results_data = []
+            for L in lesions:
+                results_data.append({
                     "ID": L["id"],
                     "Territory": L.get("territory_name", ""),
-                    "Centroid (z,y,x)": tuple(round(v,1) for v in L["centroid_zyx"]),
+                    "Centroid (z,y,x)": f"({L['centroid_zyx'][0]:.1f}, {L['centroid_zyx'][1]:.1f}, {L['centroid_zyx'][2]:.1f})",
                     "Volume (mm³)": round(L["volume_mm3"], 1),
-                    "Equiv. diameter (mm)": round(L["equiv_diam_mm"], 1),
+                    "Equivalent Diameter (mm)": round(L["equiv_diam_mm"], 1),
                 })
-            df = pd.DataFrame(rows)
-            st.dataframe(df, width="stretch", hide_index=True)
-            # Downloads
-            csv_bytes = df.to_csv(index=False).encode("utf-8")
-            st.download_button("⬇️ Download lesions CSV", data=csv_bytes, file_name="lesions.csv", mime="text/csv")
+            results_df = pd.DataFrame(results_data)
+        else:
+            results_df = pd.DataFrame({"Status": ["No aneurysms detected"]})
+        
+        # Store case data for slice viewer
+        case_data = {
+            'vol_np': vol_np,
+            'mask_np': mask_np,
+            'lesions': lesions,
+            'spacing_zyx': spacing_zyx,
+            'pred_path': pred_path,
+            'case_dir': case_dir
+        }
+        
+        # Create initial slice image
+        mid_slice = D // 2
+        slice_img = create_slice_image(case_data, mid_slice, wl, ww)
+        
+        # Success message
+        status_msg = f"""✅ Analysis Complete!
+        
+📊 **Image Properties:**
+• Volume: {D} × {H} × {W} voxels  
+• Spacing: {spacing_zyx[0]:.2f} × {spacing_zyx[1]:.2f} × {spacing_zyx[2]:.2f} mm
 
-        # Mask download
-        if st.session_state.pred_path and Path(st.session_state.pred_path).exists():
-            with open(st.session_state.pred_path, "rb") as f:
-                st.download_button("⬇️ Download mask (NIfTI)", data=f.read(), file_name=Path(st.session_state.pred_path).name, mime="application/gzip")
+🎯 **Detection Results:**
+• Found {len(lesions)} lesions
+• Atlas labels: {'Enabled' if add_labels else 'Disabled'}
 
-# ----------------------------- Footer Help ----------------------------
-with st.expander("ℹ️ Help & Notes"):
-    st.markdown(
-        """
-- **Inputs**: Upload either a **DICOM .zip** (one series) or a **NIfTI** file of your CTA.
-- **Processing Time**: Expect 5-10 minutes for analysis on CPU.
-- **Memory Limits**: Large volumes may fail due to Streamlit Cloud's memory limits. Try NIfTI format for better compression.
-- **Atlas labels**: When enabled, labels territories as ACA/MCA/PCA/VB.
-- **Display**: Use the **Axial slice** slider to scroll. Red = mask contour; green = lesion box with ID.
-- **Troubleshooting**:
-  - If DICOM fails, ensure the zip contains actual DICOM files (not just folders)
-  - Try NIfTI format if DICOM continues to fail
-  - For very large volumes, consider downsampling before upload
+🔍 **Instructions:**
+• Use the slice slider to navigate through the volume
+• Red contours show detected aneurysms
+• Green boxes show lesion IDs and territories
+• Adjust window level/width for better contrast
 """
+        
+        yield case_data, slice_img, status_msg, results_df, gr.update(maximum=D-1, value=mid_slice, visible=True)
+        
+    except Exception as e:
+        error_msg = f"❌ **Error during processing:**\n\n{str(e)}\n\n**Troubleshooting:**\n• Ensure file is a valid DICOM zip or NIfTI\n• Check file size is under 500MB\n• Try with a different file format"
+        yield None, None, error_msg, None, gr.update(visible=False)
+
+def create_slice_image(case_data, slice_idx, wl, ww):
+    """Create slice image with mask overlays."""
+    if case_data is None:
+        return None
+    
+    vol_np = case_data['vol_np']
+    mask_np = case_data['mask_np']
+    lesions = case_data['lesions']
+    
+    # Ensure valid slice index
+    if slice_idx >= vol_np.shape[0]:
+        slice_idx = vol_np.shape[0] - 1
+    elif slice_idx < 0:
+        slice_idx = 0
+    
+    # Get slice and corresponding mask
+    img_slice = vol_np[slice_idx]
+    mask_slice = mask_np[slice_idx] if slice_idx < mask_np.shape[0] else np.zeros_like(img_slice)
+    
+    # Find lesions that intersect this slice
+    lesions_here = []
+    for L in lesions:
+        z0, y0, x0, z1, y1, x1 = L["bbox_zyx"]
+        if z0 <= slice_idx < z1:
+            lesions_here.append(L)
+    
+    # Apply windowing and create overlay
+    img_u8 = window_ct(img_slice, wl, ww)
+    rgb = draw_overlay(img_u8, mask_slice, lesions_here)
+    
+    return rgb
+
+def update_slice_view(case_data, slice_idx, wl, ww):
+    """Update slice view when slider or window settings change."""
+    return create_slice_image(case_data, slice_idx, wl, ww)
+
+def download_prediction_file(case_data):
+    """Prepare prediction mask for download."""
+    if case_data is None or 'pred_path' not in case_data:
+        return None
+    return str(case_data['pred_path'])
+
+def download_results_csv(results_df):
+    """Prepare results CSV for download."""
+    if results_df is None or results_df.empty:
+        return None
+    
+    csv_path = Path(tempfile.mktemp(suffix=".csv"))
+    results_df.to_csv(csv_path, index=False)
+    return str(csv_path)
+
+# ----------------------------- Gradio Interface ---------------------------
+def create_gradio_interface():
+    """Create and configure the Gradio interface."""
+    
+    # Custom CSS for better styling
+    custom_css = """
+    .gradio-container {
+        max-width: 1200px;
+        margin: auto;
+    }
+    .upload-area {
+        border: 2px dashed #ccc;
+        border-radius: 10px;
+        padding: 20px;
+        text-align: center;
+        margin: 10px 0;
+    }
+    .status-box {
+        background: #f0f8ff;
+        border: 1px solid #add8e6;
+        border-radius: 5px;
+        padding: 15px;
+        margin: 10px 0;
+    }
+    """
+    
+    with gr.Blocks(
+        title="🧠 CTA Aneurysm Detection - GLIA-Net",
+        theme=gr.themes.Soft(),
+        css=custom_css
+    ) as app:
+        
+        # Header
+        gr.Markdown(
+            """
+            # 🧠 CTA Aneurysm Detection - GLIA-Net + Arterial Atlas
+            
+            **AI-powered detection of intracranial aneurysms in CTA images**
+            
+            Upload a DICOM series (.zip) or NIfTI file to detect aneurysms using deep learning.
+            """
+        )
+        
+        # State to store case data
+        case_data_state = gr.State(None)
+        
+        with gr.Row():
+            # Left column - Controls
+            with gr.Column(scale=1):
+                gr.Markdown("### 📁 **Input & Settings**")
+                
+                input_type = gr.Radio(
+                    choices=["DICOM (.zip)", "NIfTI (.nii/.nii.gz)"],
+                    value="DICOM (.zip)",
+                    label="Input Type",
+                    info="Select the format of your medical image file"
+                )
+                
+                file_input = gr.File(
+                    label="Upload Medical Image",
+                    file_types=[".zip", ".nii", ".gz"],
+                    file_count="single"
+                )
+                
+                gr.Markdown("### ⚙️ **Processing Options**")
+                
+                add_labels = gr.Checkbox(
+                    label="🏷️ Add arterial territory labels",
+                    value=True,
+                    info="Label detected aneurysms with arterial territories (ACA/MCA/PCA/VB)"
+                )
+                
+                gr.Markdown("### 🖼️ **Display Settings**")
+                
+                with gr.Row():
+                    wl = gr.Slider(
+                        minimum=-200, maximum=200, value=40, step=1,
+                        label="Window Level",
+                        info="Adjust image brightness"
+                    )
+                    ww = gr.Slider(
+                        minimum=100, maximum=3000, value=400, step=10,
+                        label="Window Width", 
+                        info="Adjust image contrast"
+                    )
+                
+                process_btn = gr.Button(
+                    "🚀 Run Analysis",
+                    variant="primary",
+                    size="lg"
+                )
+                
+                # Status display
+                status_display = gr.Markdown(
+                    "👆 Upload a file and click '🚀 Run Analysis' to begin",
+                    elem_classes=["status-box"]
+                )
+            
+            # Right column - Visualization
+            with gr.Column(scale=2):
+                gr.Markdown("### 🖼️ **Interactive Slice Viewer**")
+                
+                slice_image = gr.Image(
+                    label="Axial Slice with Aneurysm Detection",
+                    type="numpy",
+                    height=400,
+                    show_label=True
+                )
+                
+                slice_slider = gr.Slider(
+                    minimum=0, maximum=100, value=50, step=1,
+                    label="Slice Index",
+                    info="Navigate through axial slices",
+                    visible=False
+                )
+                
+                gr.Markdown(
+                    """
+                    **Legend:**  
+                    🔴 **Red contours** = Detected aneurysm regions  
+                    🟢 **Green boxes** = Lesion IDs + Territory labels
+                    """
+                )
+        
+        # Results section
+        gr.Markdown("### 📊 **Analysis Results**")
+        
+        results_table = gr.Dataframe(
+            label="Detected Lesions Summary",
+            wrap=True,
+            interactive=False
+        )
+        
+        # Download section
+        gr.Markdown("### ⬇️ **Download Results**")
+        
+        with gr.Row():
+            download_csv_btn = gr.Button("📄 Download CSV Report")
+            download_mask_btn = gr.Button("🧠 Download Prediction Mask")
+            
+        with gr.Row():
+            csv_download = gr.File(label="CSV Report", visible=False)
+            mask_download = gr.File(label="Prediction Mask", visible=False)
+        
+        # Information section
+        with gr.Accordion("ℹ️ **Information & Help**", open=False):
+            gr.Markdown(
+                """
+                ### 📋 **Usage Instructions**
+                1. **Upload** your CTA scan (DICOM zip or NIfTI file)
+                2. **Select** processing options (territory labeling recommended)
+                3. **Click** "🚀 Run Analysis" to start detection
+                4. **Explore** results with the interactive slice viewer
+                5. **Download** predictions and detailed reports
+                
+                ### ⚙️ **Technical Details**
+                - **Model**: GLIA-Net (Global Localization based Intracranial Aneurysm Network)
+                - **Processing Time**: ~5-10 minutes on CPU
+                - **Max File Size**: 500MB per upload
+                - **Supported Formats**: DICOM series (.zip) and NIfTI (.nii/.nii.gz)
+                
+                ### 🏥 **Arterial Territories**
+                - **ACA**: Anterior Cerebral Artery
+                - **MCA**: Middle Cerebral Artery  
+                - **PCA**: Posterior Cerebral Artery
+                - **VB**: Vertebro-Basilar system
+                
+                ### ⚠️ **Important Notice**
+                This tool is for **research purposes only** and should not be used for clinical diagnosis.
+                Always consult qualified medical professionals for medical decisions.
+                
+                ### 📚 **Citation**
+                If you use this tool in your research, please cite:
+                ```
+                GLIA-Net: Global-to-local image analysis network for intracranial aneurysm detection
+                Patterns, 2021
+                ```
+                """
+            )
+        
+        # Event handlers
+        process_btn.click(
+            fn=process_medical_image,
+            inputs=[file_input, input_type, add_labels, wl, ww],
+            outputs=[case_data_state, slice_image, status_display, results_table, slice_slider]
+        )
+        
+        # Update slice view when slider changes
+        slice_slider.change(
+            fn=update_slice_view,
+            inputs=[case_data_state, slice_slider, wl, ww],
+            outputs=[slice_image]
+        )
+        
+        # Update slice view when window settings change
+        wl.change(
+            fn=update_slice_view,
+            inputs=[case_data_state, slice_slider, wl, ww],
+            outputs=[slice_image]
+        )
+        
+        ww.change(
+            fn=update_slice_view,
+            inputs=[case_data_state, slice_slider, wl, ww],
+            outputs=[slice_image]
+        )
+        
+        # Download handlers
+        download_csv_btn.click(
+            fn=download_results_csv,
+            inputs=[results_table],
+            outputs=[csv_download]
+        )
+        
+        download_mask_btn.click(
+            fn=download_prediction_file,
+            inputs=[case_data_state],
+            outputs=[mask_download]
+        )
+    
+    return app
+
+# ----------------------------- Launch Application -------------------------
+if __name__ == "__main__":
+    # Verify required files exist
+    try:
+        ensure_exists(GLIA_ROOT, "GLIA-Net source code")
+        ensure_exists(CHECKPOINT_FILE, "GLIA-Net checkpoint")
+        print("✅ All required files found!")
+    except FileNotFoundError as e:
+        print(f"❌ {e}")
+        print("Please ensure all required files are present before launching.")
+        exit(1)
+    
+    # Create and launch the Gradio app
+    app = create_gradio_interface()
+    
+    # Launch configuration for Hugging Face Spaces
+    app.launch(
+        server_name="0.0.0.0",
+        server_port=7860,
+        share=False,
+        show_error=True,
+        enable_queue=True,
+        max_threads=1  # Limit concurrent users to avoid memory issues
     )
