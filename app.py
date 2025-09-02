@@ -190,25 +190,86 @@ def extract_zip_to_temp(upload: bytes) -> Path:
     # Return the folder that (likely) contains the DICOM series
     return tmp_root
 
+def find_dicom_directory(root_path: Path) -> Path:
+    """
+    Recursively search for a directory containing DICOM files.
+    Returns the first directory found that contains DICOM series.
+    """
+    reader = sitk.ImageSeriesReader()
+    
+    # Try the root directory first
+    series_ids = reader.GetGDCMSeriesIDs(str(root_path))
+    if series_ids:
+        return root_path
+    
+    # Search recursively in subdirectories
+    for item in root_path.rglob("*"):
+        if item.is_dir():
+            try:
+                series_ids = reader.GetGDCMSeriesIDs(str(item))
+                if series_ids:
+                    return item
+            except:
+                continue
+    
+    # If no DICOM directory found, show what's in the zip for debugging
+    all_files = list(root_path.rglob("*"))
+    file_extensions = {f.suffix.lower() for f in all_files if f.is_file()}
+    st.error(f"""
+    ❌ **No DICOM series found in the uploaded zip file.**
+    
+    **Debug info:**
+    - Total files found: {len([f for f in all_files if f.is_file()])}
+    - File extensions found: {', '.join(sorted(file_extensions)) if file_extensions else 'None'}
+    - Directory structure: {len([f for f in all_files if f.is_dir()])} subdirectories
+    
+    **Expected:**
+    - DICOM files (usually .dcm extension or no extension)
+    - Files should be readable by SimpleITK's GDCM reader
+    
+    **Troubleshooting:**
+    - Make sure your zip contains actual DICOM files from a CTA study
+    - Try uploading as individual NIfTI (.nii.gz) instead if you have that format
+    """)
+    st.stop()
+
 def read_patient_image(input_kind: str, path: Path) -> sitk.Image:
     """
     input_kind: "dcm_dir" (folder with one DICOM series) or "nii" (single file)
     Returns a SimpleITK 3D image in patient space.
     """
     if input_kind == "dcm_dir":
+        # Find the actual directory containing DICOM files
+        dicom_dir = find_dicom_directory(path)
+        
         reader = sitk.ImageSeriesReader()
-        series_ids = reader.GetGDCMSeriesIDs(str(path))
+        series_ids = reader.GetGDCMSeriesIDs(str(dicom_dir))
+        
         if not series_ids:
-            raise RuntimeError("No DICOM series found in the uploaded folder.")
+            raise RuntimeError(f"No DICOM series found in {dicom_dir}")
+        
         if len(series_ids) > 1:
-            st.info(f"ℹ️ Found {len(series_ids)} series; using the first one.")
-        file_names = reader.GetGDCMSeriesFileNames(str(path), series_ids[0])
+            st.info(f"ℹ️ Found {len(series_ids)} series in {dicom_dir.name}; using the first one.")
+        
+        file_names = reader.GetGDCMSeriesFileNames(str(dicom_dir), series_ids[0])
         reader.SetFileNames(file_names)
-        img = reader.Execute()
-        # Ensure direction is set; SITK handles it.
-        return img
+        
+        try:
+            img = reader.Execute()
+            st.success(f"✅ Successfully loaded DICOM series with {len(file_names)} slices from {dicom_dir.name}")
+            return img
+        except Exception as e:
+            st.error(f"❌ Failed to read DICOM series: {str(e)}")
+            raise
+            
     elif input_kind == "nii":
-        return sitk.ReadImage(str(path))
+        try:
+            img = sitk.ReadImage(str(path))
+            st.success(f"✅ Successfully loaded NIfTI file: {path.name}")
+            return img
+        except Exception as e:
+            st.error(f"❌ Failed to read NIfTI file: {str(e)}")
+            raise
     else:
         raise ValueError("input_kind must be 'dcm_dir' or 'nii'.")
 
@@ -218,7 +279,34 @@ def sitk_to_numpy_and_spacing(img: sitk.Image) -> tuple[np.ndarray, tuple[float,
     spacing_zyx = (sz, sy, sx)
     return arr, spacing_zyx
 
-def window_ct(img_u16_or_f32: np.ndarray, wl=40.0, ww=400.0) -> np.ndarray:
+def validate_medical_image(img: sitk.Image, vol_np: np.ndarray) -> bool:
+    """Validate that the loaded image looks like a medical CT image"""
+    try:
+        # Check dimensions
+        if img.GetDimension() != 3:
+            st.warning(f"⚠️ Expected 3D image, got {img.GetDimension()}D")
+            return False
+            
+        # Check size (reasonable for medical images)
+        size = img.GetSize()
+        if min(size) < 64 or max(size) > 2048:
+            st.warning(f"⚠️ Unusual image dimensions: {size}")
+            
+        # Check voxel values (should look like CT HU values)
+        min_val, max_val = float(vol_np.min()), float(vol_np.max())
+        if min_val > 1000 or max_val < -500:
+            st.warning(f"⚠️ Unusual intensity range: {min_val:.0f} to {max_val:.0f} (expected CT Hounsfield units)")
+            
+        # Check if image is mostly empty
+        non_zero_ratio = np.count_nonzero(vol_np) / vol_np.size
+        if non_zero_ratio < 0.1:
+            st.warning(f"⚠️ Image appears mostly empty ({non_zero_ratio*100:.1f}% non-zero voxels)")
+            
+        return True
+        
+    except Exception as e:
+        st.error(f"❌ Error validating image: {str(e)}")
+        return False
     lo, hi = wl - ww/2.0, wl + ww/2.0
     v = np.clip(img_u16_or_f32, lo, hi)
     v = (v - lo) / max(hi - lo, 1e-6)
@@ -398,8 +486,22 @@ in_kind = st.sidebar.radio("Input type", ["DICOM (.zip of a series)", "NIfTI (.n
 dicom_zip = None
 nii_file = None
 if in_kind.startswith("DICOM"):
+    st.sidebar.markdown("**📁 DICOM Requirements:**")
+    st.sidebar.markdown("""
+    - Upload a .zip file containing a DICOM series
+    - Can handle nested folders within the zip
+    - Must be CTA (CT Angiography) images
+    - Typical file sizes: 50MB - 500MB
+    """)
     dicom_zip = st.sidebar.file_uploader("Upload DICOM series (.zip)", type=["zip"])
 else:
+    st.sidebar.markdown("**🧠 NIfTI Requirements:**")
+    st.sidebar.markdown("""
+    - Upload a single .nii or .nii.gz file
+    - Must be CTA (CT Angiography) images  
+    - 3D volume expected
+    - Typical file sizes: 10MB - 100MB
+    """)
     nii_file = st.sidebar.file_uploader("Upload NIfTI (.nii or .nii.gz)", type=["nii", "nii.gz"])
 
 # Actions
@@ -420,8 +522,8 @@ if reset_case:
     st.rerun()
 
 # ---------------------------- Load the Study --------------------------
-with st.spinner("Preparing input..."):
-    if dicom_zip is not None and in_kind.startswith("DICOM"):
+if dicom_zip is not None and in_kind.startswith("DICOM"):
+    with st.spinner("Extracting and analyzing DICOM files..."):
         # Extract to a temp case dir
         if st.session_state.case_dir is None:
             st.session_state.case_dir = str(Path(tempfile.mkdtemp(prefix="cta_case_")).resolve())
@@ -430,34 +532,59 @@ with st.spinner("Preparing input..."):
         if series_dir.exists():
             shutil.rmtree(series_dir, ignore_errors=True)
         series_dir.mkdir(parents=True, exist_ok=True)
-        # Unzip
+        
+        # Unzip with progress info
+        zip_size = len(dicom_zip.getvalue())
+        st.info(f"📦 Processing zip file ({zip_size / 1024 / 1024:.1f} MB)...")
+        
         with zipfile.ZipFile(io.BytesIO(dicom_zip.getvalue())) as zf:
             zf.extractall(series_dir)
+            extracted_files = zf.namelist()
+            st.info(f"📂 Extracted {len(extracted_files)} files")
+        
         # Load image via SITK series reader
         img = read_patient_image("dcm_dir", series_dir)
-        st.session_state.patient_img = img
-        st.session_state.vol_np, st.session_state.spacing_zyx = sitk_to_numpy_and_spacing(img)
-        st.session_state.input_kind = "dcm_dir"
-        st.session_state.pred_path = None
-        st.session_state.mask_np = None
-        st.session_state.lesions = []
-        st.session_state.atlas_np = None
+        vol_np, spacing_zyx = sitk_to_numpy_and_spacing(img)
+        
+        # Validate the loaded image
+        if validate_medical_image(img, vol_np):
+            st.session_state.patient_img = img
+            st.session_state.vol_np = vol_np
+            st.session_state.spacing_zyx = spacing_zyx
+            st.session_state.input_kind = "dcm_dir"
+            st.session_state.pred_path = None
+            st.session_state.mask_np = None
+            st.session_state.lesions = []
+            st.session_state.atlas_np = None
 
-    elif nii_file is not None and in_kind.startswith("NIfTI"):
+elif nii_file is not None and in_kind.startswith("NIfTI"):
+    with st.spinner("Loading NIfTI file..."):
         if st.session_state.case_dir is None:
             st.session_state.case_dir = str(Path(tempfile.mkdtemp(prefix="cta_case_")).resolve())
         case_dir = Path(st.session_state.case_dir)
         nii_path = case_dir / "input.nii.gz"
+        
+        # Save uploaded file
+        file_size = len(nii_file.getvalue())
+        st.info(f"💾 Processing NIfTI file ({file_size / 1024 / 1024:.1f} MB)...")
+        
         with open(nii_path, "wb") as f:
             f.write(nii_file.getvalue())
+            
+        # Load image
         img = read_patient_image("nii", nii_path)
-        st.session_state.patient_img = img
-        st.session_state.vol_np, st.session_state.spacing_zyx = sitk_to_numpy_and_spacing(img)
-        st.session_state.input_kind = "nii"
-        st.session_state.pred_path = None
-        st.session_state.mask_np = None
-        st.session_state.lesions = []
-        st.session_state.atlas_np = None
+        vol_np, spacing_zyx = sitk_to_numpy_and_spacing(img)
+        
+        # Validate the loaded image
+        if validate_medical_image(img, vol_np):
+            st.session_state.patient_img = img
+            st.session_state.vol_np = vol_np
+            st.session_state.spacing_zyx = spacing_zyx
+            st.session_state.input_kind = "nii"
+            st.session_state.pred_path = None
+            st.session_state.mask_np = None
+            st.session_state.lesions = []
+            st.session_state.atlas_np = None
 
 # ------------------------------- Header -------------------------------
 st.title("CTA Aneurysm — GLIA‑Net + Arterial Atlas")
