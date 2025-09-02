@@ -87,6 +87,7 @@ try:
     from utils.project_utils import load_config, get_logger, get_devices
     from core import Inferencer
     from data_loader import AneurysmSegTestManager
+    import torch
 except Exception as e:
     st.exception(e)
     st.error("❌ Failed to import GLIA‑Net internals from the repo. Make sure the repo is complete.")
@@ -183,13 +184,6 @@ def run_glianet_inference(input_path: Path,
     return pred_path
 
 # ------------------------------ IO Utils ------------------------------
-def extract_zip_to_temp(upload: bytes) -> Path:
-    tmp_root = Path(tempfile.mkdtemp(prefix="cta_case_"))
-    with zipfile.ZipFile(io.BytesIO(upload)) as zf:
-        zf.extractall(tmp_root)
-    # Return the folder that (likely) contains the DICOM series
-    return tmp_root
-
 def find_dicom_directory(root_path: Path) -> Path:
     """
     Recursively search for a directory containing DICOM files.
@@ -198,9 +192,12 @@ def find_dicom_directory(root_path: Path) -> Path:
     reader = sitk.ImageSeriesReader()
     
     # Try the root directory first
-    series_ids = reader.GetGDCMSeriesIDs(str(root_path))
-    if series_ids:
-        return root_path
+    try:
+        series_ids = reader.GetGDCMSeriesIDs(str(root_path))
+        if series_ids:
+            return root_path
+    except:
+        pass
     
     # Search recursively in subdirectories
     for item in root_path.rglob("*"):
@@ -307,6 +304,8 @@ def validate_medical_image(img: sitk.Image, vol_np: np.ndarray) -> bool:
     except Exception as e:
         st.error(f"❌ Error validating image: {str(e)}")
         return False
+
+def window_ct(img_u16_or_f32: np.ndarray, wl=40.0, ww=400.0) -> np.ndarray:
     lo, hi = wl - ww/2.0, wl + ww/2.0
     v = np.clip(img_u16_or_f32, lo, hi)
     v = (v - lo) / max(hi - lo, 1e-6)
@@ -457,7 +456,6 @@ st.sidebar.code(str(GLIA_ROOT), language="bash")
 
 # Device selection
 try:
-    import torch
     has_cuda = torch.cuda.is_available()
 except Exception:
     has_cuda = False
@@ -626,8 +624,8 @@ with left:
 
         img_u8 = window_ct(vol[z], wl, ww)
         rgb = draw_overlay(img_u8, mask_slice, lesions_here=lesions_here, show_boxes=show_boxes)
-        # FIXED: Changed use_column_width to use_container_width
-        st.image(rgb, caption=f"Axial slice {z}", use_container_width=True)
+        # FIXED: Updated to newest Streamlit API
+        st.image(rgb, caption=f"Axial slice {z}", width="stretch")
 
 with right:
     st.subheader("Pipeline")
@@ -703,7 +701,7 @@ with right:
                     "Equiv. diameter (mm)": round(L["equiv_diam_mm"], 1),
                 })
             df = pd.DataFrame(rows)
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.dataframe(df, width="stretch", hide_index=True)
             # Downloads
             csv_bytes = df.to_csv(index=False).encode("utf-8")
             st.download_button("⬇️ Download lesions CSV", data=csv_bytes, file_name="lesions.csv", mime="text/csv")
